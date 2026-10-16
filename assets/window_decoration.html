@@ -1,0 +1,48 @@
+<meta name="shell-surface" data-name="window_decoration" data-layer="window" data-height="32" data-exclusive-zone="0" />
+<div
+  id="window-frame"
+  class="window-frame"
+  :class.focused="win.is_focused"
+  :class.floating="win.is_floating"
+  :class.urgent="win.is_urgent"
+>
+  <div id="window-titlebar" class="window-titlebar">
+    <div class="titlebar-left">
+      <icon data-icon="window" class="window-app-icon" />
+      <span class="window-app-badge">{{ win.app_id | default('app') }}</span>
+    </div>
+
+    <div class="titlebar-center">
+      <span class="window-titlebar-text">{{ win.title | default('Window') | truncate(48) }}</span>
+    </div>
+
+    <div class="titlebar-controls">
+      <button
+        id="win-float-btn"
+        class="win-ctrl-btn btn-float"
+        data-icon="float"
+        :class.active="win.is_floating"
+        on-click="wm:toggle-floating()"
+      >
+        □
+      </button>
+      <button
+        id="win-maximize-btn"
+        class="win-ctrl-btn btn-maximize"
+        data-icon="maximize"
+        :class.active="win.is_maximized"
+        on-click="wm:toggle-maximize()"
+      >
+        □
+      </button>
+      <button
+        id="win-close-btn"
+        class="win-ctrl-btn btn-close"
+        data-icon="close"
+        on-click="wm:close-window()"
+      >
+        ✕
+      </button>
+    </div>
+  </div>
+</div>

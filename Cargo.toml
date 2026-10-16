@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/wm-proto",
+    "crates/reactive-state",
+    "crates/sys-providers",
+    "crates/html-dom",
+    "crates/css-style",
+    "crates/layout-engine",
+    "crates/renderer",
+    "crates/wm-core",
+    "crates/ipc-server",
+    "crates/wm-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Lumina WM Contributors"]
+
+[workspace.dependencies]
+wm-proto = { path = "crates/wm-proto" }
+reactive-state = { path = "crates/reactive-state" }
+sys-providers = { path = "crates/sys-providers" }
+html-dom = { path = "crates/html-dom" }
+css-style = { path = "crates/css-style" }
+layout-engine = { path = "crates/layout-engine" }
+renderer = { path = "crates/renderer" }
+wm-core = { path = "crates/wm-core" }
+ipc-server = { path = "crates/ipc-server" }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+bitflags = { version = "2.6", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+taffy = "0.7"
+tiny-skia = "0.11"
+ab_glyph = "0.2"
+csscolorparser = "0.7"
+notify = "6.1"
+clap = { version = "4.5", features = ["derive"] }

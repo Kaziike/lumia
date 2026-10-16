@@ -1,0 +1,43 @@
+<meta name="shell-surface" data-name="launcher" data-layer="overlay" data-width="640" data-height="440" data-keyboard-mode="exclusive" data-visible="false" />
+<div id="launcher" class="modal-surface launcher-modal">
+  <div id="launcher-header" class="launcher-header">
+    <div id="launcher-search-box" class="search-box">
+      <icon data-icon="search" class="search-icon" />
+      <input
+        id="launcher-search-input"
+        class="search-input"
+        type="text"
+        placeholder="Search applications, commands, or workspaces..."
+        :value="apps.query"
+        on-input="apps:set-query($event.value)"
+      />
+    </div>
+    <button id="launcher-close-btn" class="icon-btn close-btn" data-icon="close" on-click="shell:close-widget('launcher')">
+      ✕
+    </button>
+  </div>
+
+  <div id="launcher-results" class="launcher-list">
+    <button
+      class="app-item"
+      data-for="app in apps.filtered"
+      data-key="app.id"
+      :class.active="app.is_selected"
+      on-click="apps:launch({{ app.id }}); shell:close-widget('launcher')"
+    >
+      <div class="app-item-left">
+        <icon data-icon="apps" class="app-icon" />
+        <div class="app-meta">
+          <span class="app-name">{{ app.name }}</span>
+          <span class="app-desc">{{ app.description | default('Desktop Application') | truncate(48) }}</span>
+        </div>
+      </div>
+      <span class="app-badge">{{ app.category | default('App') }}</span>
+    </button>
+  </div>
+
+  <div id="launcher-footer" class="launcher-footer">
+    <span class="footer-hint">Enter to Launch</span>
+    <span class="footer-hint">Esc to Close</span>
+  </div>
+</div>

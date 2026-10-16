@@ -1,0 +1,88 @@
+<meta name="shell-surface" data-name="quick_settings" data-layer="overlay" data-anchor="top,right" data-width="380" data-height="520" data-visible="false" />
+<div id="quick-settings" class="modal-surface qs-panel">
+  <div id="qs-header" class="qs-header">
+    <div class="qs-title-group">
+      <span class="qs-title">Control Center</span>
+      <span class="qs-subtitle">{{ sys.clock.date }}</span>
+    </div>
+    <button id="qs-close-btn" class="icon-btn close-btn" data-icon="close" on-click="shell:close-widget('quick_settings')">
+      ✕
+    </button>
+  </div>
+
+  <div id="qs-toggles" class="qs-grid">
+    <button class="qs-tile active" on-click="sys:toggle-mute()" :class.active="!sys.audio.muted">
+      <icon data-icon="volume" class="qs-tile-icon" />
+      <div class="qs-tile-labels">
+        <span class="qs-tile-name">Audio</span>
+        <span class="qs-tile-state">{{ sys.audio.percent }}%</span>
+      </div>
+    </button>
+
+    <button class="qs-tile active">
+      <icon data-icon="wifi" class="qs-tile-icon" />
+      <div class="qs-tile-labels">
+        <span class="qs-tile-name">Network</span>
+        <span class="qs-tile-state">{{ sys.network.ssid | default('Connected') }}</span>
+      </div>
+    </button>
+
+    <button class="qs-tile" :class.active="notif.dnd" on-click="notif:toggle-dnd()">
+      <icon data-icon="bell" class="qs-tile-icon" />
+      <div class="qs-tile-labels">
+        <span class="qs-tile-name">Do Not Disturb</span>
+        <span class="qs-tile-state">{{ notif.dnd }}</span>
+      </div>
+    </button>
+
+    <button class="qs-tile" on-click="wm:cycle-layout-mode()">
+      <icon data-icon="layout" class="qs-tile-icon" />
+      <div class="qs-tile-labels">
+        <span class="qs-tile-name">Layout</span>
+        <span class="qs-tile-state">{{ wm.layout_mode | upper }}</span>
+      </div>
+    </button>
+  </div>
+
+  <div id="qs-sliders" class="qs-sliders">
+    <div class="slider-row">
+      <icon data-icon="volume" class="slider-icon" />
+      <span class="slider-label">Volume {{ sys.audio.percent }}%</span>
+      <div class="slider-actions">
+        <button class="mini-btn" on-click="sys:change-volume(-5)">-</button>
+        <button class="mini-btn" on-click="sys:change-volume(5)">+</button>
+      </div>
+    </div>
+
+    <div class="slider-row">
+      <span class="slider-label">Theme</span>
+      <div class="slider-actions">
+        <button class="mini-btn" on-click="shell:set-theme('catppuccin')">Catppuccin</button>
+        <button class="mini-btn" on-click="shell:set-theme('cyberpunk')">Cyberpunk</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="qs-notifications" class="qs-notif-section">
+    <div class="qs-notif-header">
+      <span class="qs-section-title">Notifications ({{ notif.unread_count }})</span>
+      <button id="notif-clear-btn" class="mini-btn" on-click="notif:clear-all()">Clear All</button>
+    </div>
+
+    <div id="notif-list" class="notif-list">
+      <div
+        class="notif-card"
+        data-for="item in notif.list"
+        data-key="item.id"
+        :class.urgent="item.urgency == 'critical'"
+      >
+        <div class="notif-card-top">
+          <span class="notif-app">{{ item.app_name | default('System') }}</span>
+          <button class="notif-dismiss-btn" on-click="notif:dismiss({{ item.id }})">✕</button>
+        </div>
+        <span class="notif-summary">{{ item.summary }}</span>
+        <span class="notif-body">{{ item.body | truncate(52) }}</span>
+      </div>
+    </div>
+  </div>
+</div>

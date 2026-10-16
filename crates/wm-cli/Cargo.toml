@@ -1,0 +1,34 @@
+[package]
+name = "wm-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+default-run = "luminactl"
+
+[lib]
+name = "wm_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lumina-wm"
+path = "src/bin/lumina-wm.rs"
+
+[[bin]]
+name = "luminactl"
+path = "src/bin/luminactl.rs"
+
+[dependencies]
+wm-proto.workspace = true
+reactive-state.workspace = true
+sys-providers.workspace = true
+html-dom.workspace = true
+css-style.workspace = true
+layout-engine.workspace = true
+renderer.workspace = true
+wm-core.workspace = true
+ipc-server.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

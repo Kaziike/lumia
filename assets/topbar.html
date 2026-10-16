@@ -1,0 +1,82 @@
+<meta name="shell-surface" data-name="topbar" data-layer="top" data-anchor="top,left,right" data-height="44" data-exclusive-zone="44" />
+<div id="topbar" class="surface-bar topbar">
+  <div id="topbar-left" class="bar-section bar-left">
+    <button id="launcher-btn" class="pill-btn accent-btn" on-click="shell:toggle-widget('launcher')">
+      <icon data-icon="launcher" class="stat-icon" />
+      <span>Lumina</span>
+    </button>
+
+    <div id="workspaces" class="workspaces-strip">
+      <button
+        class="ws-btn"
+        data-for="ws in wm.workspaces"
+        data-key="ws.id"
+        :class.active="ws.is_active"
+        :class.focused="ws.is_focused"
+        :class.urgent="ws.is_urgent"
+        on-click="wm:focus-workspace({{ ws.idx }})"
+      >
+        {{ ws.name }}
+      </button>
+    </div>
+
+    <button id="layout-badge" class="pill-badge layout-badge" on-click="wm:cycle-layout-mode()">
+      {{ wm.layout_mode | upper }}
+    </button>
+  </div>
+
+  <div id="topbar-center" class="bar-section bar-center">
+    <div id="focused-window-pill" class="window-pill">
+      <span class="window-title">{{ wm.focused_window.title | default('Lumina Desktop') | truncate(36) }}</span>
+    </div>
+  </div>
+
+  <div id="topbar-right" class="bar-section bar-right">
+    <div id="cpu-pill" class="stat-pill cpu-pill">
+      <icon data-icon="cpu" class="stat-icon" />
+      <span class="stat-text">CPU {{ sys.cpu.usage_pct | round(0) }}%</span>
+    </div>
+
+    <div id="ram-pill" class="stat-pill ram-pill">
+      <icon data-icon="ram" class="stat-icon" />
+      <span class="stat-text">{{ sys.ram.used_gb | round(1) }}G</span>
+    </div>
+
+    <button
+      id="audio-pill"
+      class="stat-pill audio-pill"
+      :class.muted="sys.audio.muted"
+      on-click="sys:toggle-mute()"
+      on-scroll-up="sys:change-volume(5)"
+      on-scroll-down="sys:change-volume(-5)"
+    >
+      <icon data-icon="volume" class="stat-icon" />
+      <span class="stat-text">{{ sys.audio.percent }}%</span>
+    </button>
+
+    <div id="net-pill" class="stat-pill net-pill">
+      <icon data-icon="wifi" class="stat-icon" />
+      <span class="stat-text">{{ sys.network.ssid | default('Online') }}</span>
+    </div>
+
+    <div id="battery-pill" class="stat-pill battery-pill" :class.charging="sys.battery.charging">
+      <icon data-icon="battery" class="stat-icon" />
+      <span class="stat-text">{{ sys.battery.percent | default(100) }}%</span>
+    </div>
+
+    <button
+      id="notif-btn"
+      class="pill-btn notif-pill"
+      :class.urgent="notif.unread_count"
+      on-click="shell:toggle-widget('quick_settings')"
+    >
+      <icon data-icon="bell" class="stat-icon" />
+      <span class="notif-count">{{ notif.unread_count }}</span>
+    </button>
+
+    <button id="clock-pill" class="pill-btn clock-pill" on-click="shell:toggle-widget('quick_settings')">
+      <icon data-icon="clock" class="stat-icon" />
+      <span class="clock-time">{{ sys.clock.time }}</span>
+    </button>
+  </div>
+</div>

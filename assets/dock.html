@@ -1,0 +1,43 @@
+<meta name="shell-surface" data-name="dock" data-layer="top" data-anchor="bottom" data-height="58" data-exclusive-zone="0" />
+<div id="dock" class="surface-dock dock-container">
+  <div id="dock-pinned" class="dock-section dock-pinned">
+    <button class="dock-btn dock-launch-btn" on-click="shell:toggle-widget('launcher')">
+      <icon data-icon="launcher" class="stat-icon" />
+      <span>Apps</span>
+    </button>
+    <button class="dock-btn" on-click="apps:launch('org.wezfurlong.wezterm')">
+      <icon data-icon="terminal" class="stat-icon" />
+      <span>Term</span>
+    </button>
+    <button class="dock-btn" on-click="apps:launch('org.mozilla.firefox')">
+      <icon data-icon="browser" class="stat-icon" />
+      <span>Web</span>
+    </button>
+    <button class="dock-btn" on-click="apps:launch('org.gnome.Nautilus')">
+      <icon data-icon="files" class="stat-icon" />
+      <span>Files</span>
+    </button>
+    <button class="dock-btn" on-click="apps:launch('com.visualstudio.code')">
+      <icon data-icon="code" class="stat-icon" />
+      <span>Code</span>
+    </button>
+  </div>
+
+  <div class="dock-divider"></div>
+
+  <div id="dock-windows" class="dock-section dock-running">
+    <button
+      class="dock-window-item"
+      data-for="win in wm.windows"
+      data-key="win.id"
+      :class.focused="win.is_focused"
+      :class.active="win.is_focused"
+      :class.urgent="win.is_urgent"
+      :class.minimized="win.is_minimized"
+      on-click="wm:focus-or-minimize-window({{ win.id }})"
+    >
+      <icon data-icon="window" class="dock-win-icon" />
+      <span class="dock-win-title">{{ win.title | truncate(20) }}</span>
+    </button>
+  </div>
+</div>

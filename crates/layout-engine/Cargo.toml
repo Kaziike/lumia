@@ -1,0 +1,12 @@
+[package]
+name = "layout-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wm-proto.workspace = true
+css-style.workspace = true
+taffy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
