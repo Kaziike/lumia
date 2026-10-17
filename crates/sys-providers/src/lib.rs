@@ -895,6 +895,10 @@ impl StateProvider for AudioProvider {
                     value: StateValue::Int(self.brightness_percent as i64),
                 }])
             }
+            SysAction::SetResolution { width, height } => Ok(vec![StatePatch::Set {
+                path: "sys.display.resolution".to_string(),
+                value: StateValue::String(format!("{width}x{height}")),
+            }]),
         }
     }
 }

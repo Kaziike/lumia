@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod daemon;
 pub mod nested;
+pub mod output_config;
 pub mod wayland_compositor;
 
 pub use cli::*;

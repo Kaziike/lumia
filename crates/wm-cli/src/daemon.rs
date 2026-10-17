@@ -12,10 +12,10 @@ use sys_providers::SystemProviderManager;
 use wm_core::{LuminaWmCore, WaylandCompositorHost};
 use wm_proto::{
     ActionCommand, ComputedStyle, DomElementInfo, DomTreeView, FrameBuffer, IpcCommand,
-    IpcPayload, IpcRequest, IpcResponse, LayoutBox, LayoutSolver, NodeId, Point,
+    IpcPayload, IpcRequest, IpcResponse, LayoutBox, LayoutSolver, NodeId, OutputDescriptor, Point,
     Rect, ReloadTarget, ShellAction, Size, StatePatch, StateProvider, StateValue, StyleEngine,
-    SurfaceMetadata, SurfaceRenderer, WidgetStatus, WindowDescriptor, WindowManagerEngine,
-    WmAction,
+    SurfaceMetadata, SurfaceRenderer, SysAction, WidgetStatus, WindowDescriptor,
+    WindowManagerEngine, WmAction,
 };
 
 const DEFAULT_TOPBAR_HTML: &str = include_str!("../../../assets/topbar.html");
@@ -74,6 +74,8 @@ pub struct LuminaDaemon {
     pub terminal_lines: Vec<String>,
     pub terminal_input: String,
     pub terminal_rev: u64,
+    pub output_width: u32,
+    pub output_height: u32,
     cached_wallpaper: Option<(String, FrameBuffer)>,
     window_frame_cache: HashMap<u64, (WindowCacheKey, FrameBuffer)>,
 }
@@ -132,6 +134,10 @@ impl LuminaDaemon {
 
         // Initialize system providers into StateStore
         sys_providers.init_store(&mut store);
+        store.set(
+            "sys.display.resolution",
+            StateValue::String("1920x1080".to_string()),
+        );
         sys_providers.notif.push_notification(
             "Lumina WM",
             "Pure-Rust HTML/CSS Compositor Ready",
@@ -168,6 +174,8 @@ impl LuminaDaemon {
             terminal_lines: Vec::new(),
             terminal_input: String::new(),
             terminal_rev: 1,
+            output_width: 1920,
+            output_height: 1080,
             cached_wallpaper: None,
             window_frame_cache: HashMap::new(),
         };
@@ -193,10 +201,75 @@ impl LuminaDaemon {
     /// Starts the embedded `RealWaylandServer` so real Wayland client applications can connect
     /// and render their `wl_shm` surfaces inside Lumina WM.
     pub fn enable_wayland_server(&mut self) -> Result<String, String> {
-        let server = RealWaylandServer::new()?;
+        let mut server = RealWaylandServer::new()?;
+        server.set_output_mode(self.output_width, self.output_height, 1.0);
         let sock = server.socket_name().to_string();
         self.wayland_server = Some(server);
         Ok(sock)
+    }
+
+    /// Dynamically resizes the active display output and updates all shell surfaces,
+    /// widgets, WM usable area, and embedded Wayland output geometry 1:1.
+    pub fn resize_output(&mut self, width: u32, height: u32, scale: f32) {
+        let w = width.max(640);
+        let h = height.max(480);
+        if self.output_width == w && self.output_height == h {
+            return;
+        }
+        self.output_width = w;
+        self.output_height = h;
+        self.cached_wallpaper = None;
+        self.window_frame_cache.clear();
+
+        self.wm.add_output(OutputDescriptor {
+            name: "eDP-1".to_string(),
+            make: "Lumina".to_string(),
+            model: "Virtual Wayland Display".to_string(),
+            rect: Rect::new(0.0, 0.0, w as f32, h as f32),
+            usable_rect: Rect::new(0.0, 44.0, w as f32, (h as f32 - 44.0).max(100.0)),
+            scale: scale.max(1.0),
+            refresh_hz: 60,
+        });
+
+        for name in ["panel", "topbar"] {
+            if let Some(surf) = self.surfaces.get_mut(name) {
+                surf.viewport = Size::new(w as f32, 44.0);
+                surf.dirty = true;
+                surf.last_frame = None;
+            }
+            if let Some(widget) = self.widgets.get_mut(name) {
+                widget.width = w;
+                widget.height = 44;
+            }
+        }
+
+        if let Some(widget) = self.widgets.get_mut("dock") {
+            widget.width = 680;
+            widget.height = 58;
+        }
+        for name in ["quick_settings", "control-center"] {
+            if let Some(widget) = self.widgets.get_mut(name) {
+                widget.width = 380;
+                widget.height = 520;
+            }
+        }
+        if let Some(widget) = self.widgets.get_mut("launcher") {
+            widget.width = 640;
+            widget.height = 440;
+        }
+
+        if let Some(ref mut wl) = self.wayland_server {
+            wl.set_output_mode(w, h, scale);
+        }
+
+        self.store.set(
+            "sys.display.resolution",
+            StateValue::String(format!("{w}x{h}")),
+        );
+
+        let patches = self.wm.export_state_patches();
+        self.apply_state_patches(patches);
+        self.recompute_all_surfaces();
     }
 
     /// Polls connected Wayland client applications, handling new windows, title changes, frame commits, and closes.
@@ -539,11 +612,11 @@ impl LuminaDaemon {
         desktop
     }
 
-    /// Composites a complete 1920x1080 desktop screenshot (Wallpaper + Tiled/Floating Windows
+    /// Composites a complete desktop screenshot at native output resolution (Wallpaper + Tiled/Floating Windows
     /// with CSS Server-Side Decorations & Application UIs + Topbar + Dock + Active Overlays).
     pub fn render_desktop_frame(&mut self) -> FrameBuffer {
-        let width = 1920u32;
-        let height = 1080u32;
+        let width = self.output_width.max(640);
+        let height = self.output_height.max(480);
 
         // 1. Copy cached desktop background gradient
         let mut desktop = self.get_or_build_wallpaper(width, height);
@@ -554,7 +627,12 @@ impl LuminaDaemon {
             .outputs()
             .first()
             .map(|o| o.usable_rect)
-            .unwrap_or(Rect::new(0.0, 44.0, 1920.0, 1036.0));
+            .unwrap_or(Rect::new(
+                0.0,
+                44.0,
+                width as f32,
+                (height as f32 - 44.0).max(100.0),
+            ));
         let placements = self.wm.compute_window_placements(usable);
         let windows_map: HashMap<u64, WindowDescriptor> = self
             .wm
@@ -830,6 +908,14 @@ impl LuminaDaemon {
                     Ok(format!("Set theme to '{name}'"))
                 }
             },
+            ActionCommand::Sys(SysAction::SetResolution { width, height }) => {
+                let _ = crate::output_config::request_parent_wayland_mode(
+                    width as i32,
+                    height as i32,
+                );
+                self.resize_output(width, height, 1.0);
+                Ok(format!("Set display resolution to {width}x{height}"))
+            }
             ActionCommand::Sys(_) | ActionCommand::Notif(_) => {
                 let patches = self.sys_providers.handle_action(&action)?;
                 self.apply_state_patches(patches);
@@ -887,19 +973,26 @@ impl LuminaDaemon {
     fn spawn_app_window(&mut self, app_id: &str) {
         let lower = app_id.to_ascii_lowercase();
 
-        // If the embedded Wayland server is active and the user launched a real desktop app
-        // (not the built-in Lumina Terminal), spawn the real Wayland client binary!
-        let is_builtin_terminal = lower == "org.lumina.terminal"
-            || lower == "alacritty"
-            || lower == "terminal";
+        // Only use the built-in simulated terminal when explicitly requested via `org.lumina.terminal`
+        // or when running in headless mode without an embedded Wayland server.
+        let is_builtin_terminal = lower == "org.lumina.terminal" || self.wayland_server.is_none();
 
         if !is_builtin_terminal && self.wayland_server.is_some() {
-            let exec_cmd = self
-                .sys_providers
-                .apps
-                .find_app(app_id)
-                .map(|entry| entry.exec.clone())
-                .unwrap_or_else(|| app_id.to_string());
+            let exec_cmd = if (lower == "alacritty"
+                || lower == "org.alacritty.alacritty"
+                || lower == "terminal"
+                || lower == "org.gnome.console"
+                || lower == "kgx")
+                && Path::new("/usr/bin/kgx").exists()
+            {
+                "kgx".to_string()
+            } else {
+                self.sys_providers
+                    .apps
+                    .find_app(app_id)
+                    .map(|entry| entry.exec.clone())
+                    .unwrap_or_else(|| app_id.to_string())
+            };
 
             if let Some(ref mut wl) = self.wayland_server {
                 if wl.spawn_client(&exec_cmd).is_ok() {

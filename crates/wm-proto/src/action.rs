@@ -127,6 +127,7 @@ pub enum SysAction {
     ChangeVolume { delta: i8 },
     ToggleMute,
     SetBrightness { percent: u8 },
+    SetResolution { width: u32, height: u32 },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -418,6 +419,38 @@ impl ActionCommand {
                     .map_err(|e| e.to_string())?
                     .clamp(0.0, 100.0) as u8;
                 SysAction::SetBrightness { percent }
+            }
+            "set-resolution" => {
+                let (width, height) = if args.len() >= 2 {
+                    let w = args[0]
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|e| format!("Invalid width in set-resolution: {e}"))?;
+                    let h = args[1]
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|e| format!("Invalid height in set-resolution: {e}"))?;
+                    (w, h)
+                } else if let Some(first) = args.first() {
+                    let (w_str, h_str) = first
+                        .split_once('x')
+                        .or_else(|| first.split_once('X'))
+                        .ok_or_else(|| {
+                            "set-resolution requires 'WxH' or (width, height)".to_string()
+                        })?;
+                    let w = w_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|e| format!("Invalid width in set-resolution: {e}"))?;
+                    let h = h_str
+                        .trim()
+                        .parse::<u32>()
+                        .map_err(|e| format!("Invalid height in set-resolution: {e}"))?;
+                    (w, h)
+                } else {
+                    return Err("set-resolution requires 'WxH' or (width, height)".to_string());
+                };
+                SysAction::SetResolution { width, height }
             }
             other => return Err(format!("Unknown sys action '{other}'")),
         };

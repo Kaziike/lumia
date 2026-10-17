@@ -2,11 +2,16 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Seek, SeekFrom, Write};
 use std::os::fd::AsFd;
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
 
 use memmap2::MmapOptions;
+use wayland_protocols::wp::viewporter::server::{
+    wp_viewport::{self, WpViewport},
+    wp_viewporter::{self, WpViewporter},
+};
 use wayland_protocols::xdg::decoration::zv1::server::{
     zxdg_decoration_manager_v1::{self, ZxdgDecorationManagerV1},
     zxdg_toplevel_decoration_v1::{self, ZxdgToplevelDecorationV1},
@@ -142,15 +147,23 @@ pub struct WaylandState {
     toplevels: HashMap<u64, ToplevelEntry>,
     pointers: Vec<WlPointer>,
     keyboards: Vec<WlKeyboard>,
+    pub outputs: Vec<WlOutput>,
+    pub output_width: i32,
+    pub output_height: i32,
+    pub output_scale: i32,
     focused_pointer_surface: Option<ObjectId>,
     focused_keyboard_surface: Option<ObjectId>,
+    pub mods_depressed: u32,
+    pub mods_latched: u32,
+    pub mods_locked: u32,
+    pub mods_group: u32,
     keymap_file: Option<(File, u32)>,
     pub events: Vec<WaylandCompositorEvent>,
 }
 
 impl WaylandState {
     fn new() -> Self {
-        let keymap_file = create_minimal_xkb_keymap_file();
+        let keymap_file = create_full_xkb_keymap_file();
         Self {
             start_time: Instant::now(),
             next_serial: 1,
@@ -161,8 +174,16 @@ impl WaylandState {
             toplevels: HashMap::new(),
             pointers: Vec::new(),
             keyboards: Vec::new(),
+            outputs: Vec::new(),
+            output_width: 1920,
+            output_height: 1080,
+            output_scale: 1,
             focused_pointer_surface: None,
             focused_keyboard_surface: None,
+            mods_depressed: 0,
+            mods_latched: 0,
+            mods_locked: 0,
+            mods_group: 0,
             keymap_file,
             events: Vec::new(),
         }
@@ -176,6 +197,48 @@ impl WaylandState {
 
     fn elapsed_ms(&self) -> u32 {
         self.start_time.elapsed().as_millis() as u32
+    }
+
+    fn focus_surface_keyboard(&mut self, target_surf_id: Option<ObjectId>) {
+        if self.focused_keyboard_surface == target_surf_id {
+            return;
+        }
+
+        self.keyboards.retain(|kb| kb.is_alive());
+
+        if let Some(old_surf_id) = self.focused_keyboard_surface.take() {
+            if let Some(old_surf) = self.surfaces.get(&old_surf_id) {
+                let old_wl_surf = old_surf.wl_surface.clone();
+                let old_client = old_wl_surf.client();
+                let leave_serial = self.next_serial();
+                for kb in &self.keyboards {
+                    if kb.client() == old_client {
+                        kb.leave(leave_serial, &old_wl_surf);
+                    }
+                }
+            }
+        }
+
+        if let Some(new_surf_id) = target_surf_id {
+            if let Some(new_surf) = self.surfaces.get(&new_surf_id) {
+                let new_wl_surf = new_surf.wl_surface.clone();
+                let new_client = new_wl_surf.client();
+                let enter_serial = self.next_serial();
+                for kb in &self.keyboards {
+                    if kb.client() == new_client {
+                        kb.enter(enter_serial, &new_wl_surf, Vec::new());
+                        kb.modifiers(
+                            enter_serial,
+                            self.mods_depressed,
+                            self.mods_latched,
+                            self.mods_locked,
+                            self.mods_group,
+                        );
+                    }
+                }
+                self.focused_keyboard_surface = Some(new_surf_id);
+            }
+        }
     }
 }
 
@@ -203,6 +266,7 @@ impl RealWaylandServer {
         dh.create_global::<WaylandState, WlDataDeviceManager, ()>(3, ());
         dh.create_global::<WaylandState, XdgWmBase, ()>(5, ());
         dh.create_global::<WaylandState, ZxdgDecorationManagerV1, ()>(1, ());
+        dh.create_global::<WaylandState, WpViewporter, ()>(1, ());
 
         let socket = ListeningSocket::bind_auto("wayland-lumina", 0..32)
             .map_err(|e| format!("Failed to bind Wayland listening socket: {e}"))?;
@@ -225,6 +289,36 @@ impl RealWaylandServer {
         &self.socket_name
     }
 
+    /// Updates the Wayland `wl_output` resolution and scale factor, broadcasting changes to connected clients.
+    pub fn set_output_mode(&mut self, width: u32, height: u32, scale: f32) {
+        let w = (width as i32).max(320);
+        let h = (height as i32).max(200);
+        let s = scale.round().max(1.0) as i32;
+        if self.state.output_width == w
+            && self.state.output_height == h
+            && self.state.output_scale == s
+        {
+            return;
+        }
+        self.state.output_width = w;
+        self.state.output_height = h;
+        self.state.output_scale = s;
+        self.state.outputs.retain(|o| o.is_alive());
+        for output in &self.state.outputs {
+            output.mode(
+                wl_output::Mode::Current | wl_output::Mode::Preferred,
+                w,
+                h,
+                60000,
+            );
+            if output.version() >= 2 {
+                output.scale(s);
+                output.done();
+            }
+        }
+        let _ = self.display.flush_clients();
+    }
+
     /// Spawns a real Linux Wayland client application connected to this compositor's `WAYLAND_DISPLAY`.
     pub fn spawn_client(&mut self, exec_cmd: &str) -> Result<(), String> {
         let trimmed = exec_cmd.trim();
@@ -232,30 +326,90 @@ impl RealWaylandServer {
             return Err("Empty exec command".to_string());
         }
 
-        let child = Command::new("sh")
-            .arg("-c")
-            .arg(trimmed)
-            // Detach from the host desktop's D-Bus session bus so single-instance GApplication apps
-            // (e.g. Nautilus, GNOME Text Editor, Calculator, Decibels) open a real Wayland window
-            // inside Lumina WM instead of forwarding activation to the host GNOME session.
-            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+        let mut cmd_str = if (trimmed.eq_ignore_ascii_case("alacritty")
+            || trimmed.eq_ignore_ascii_case("terminal"))
+            && !Path::new("/usr/bin/alacritty").exists()
+        {
+            "kgx".to_string()
+        } else if trimmed.eq_ignore_ascii_case("antigravity")
+            && Path::new("/home/kass/.local/share/Antigravity-x64/antigravity").exists()
+        {
+            "/home/kass/.local/share/Antigravity-x64/antigravity".to_string()
+        } else {
+            trimmed.to_string()
+        };
+
+        let lower = cmd_str.to_ascii_lowercase();
+        let is_electron = lower.contains("antigravity")
+            || lower.contains("code")
+            || lower.contains("chromium")
+            || lower.contains("electron")
+            || lower.contains("brave");
+
+        if is_electron {
+            for flag in [
+                "--ozone-platform=wayland",
+                "--enable-features=UseOzonePlatform",
+                "--disable-gpu",
+                "--disable-gpu-compositing",
+                "--disable-gpu-sandbox",
+                "--no-sandbox",
+            ] {
+                if !cmd_str.contains(flag) {
+                    cmd_str.push(' ');
+                    cmd_str.push_str(flag);
+                }
+            }
+            if lower.contains("antigravity") && !cmd_str.contains("--user-data-dir") {
+                cmd_str.push_str(" --user-data-dir=/tmp/lumina-antigravity-session");
+            }
+        }
+
+        let in_cage = std::env::var("LUMINA_IN_CAGE").is_ok();
+        let has_dbus_run_session = Path::new("/usr/bin/dbus-run-session").exists();
+
+        let mut command = if !in_cage && has_dbus_run_session {
+            let mut c = Command::new("/usr/bin/dbus-run-session");
+            c.arg("--").arg("sh").arg("-c").arg(&cmd_str);
+            c.env_remove("DBUS_SESSION_BUS_ADDRESS");
+            c
+        } else if in_cage
+            && std::env::var("DBUS_SESSION_BUS_ADDRESS").is_err()
+            && has_dbus_run_session
+        {
+            let mut c = Command::new("/usr/bin/dbus-run-session");
+            c.arg("--").arg("sh").arg("-c").arg(&cmd_str);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&cmd_str);
+            if !in_cage && !is_electron {
+                c.env_remove("DBUS_SESSION_BUS_ADDRESS");
+            }
+            c
+        };
+
+        let child = command
             .env_remove("DISPLAY")
             .env("WAYLAND_DISPLAY", &self.socket_name)
             .env("XDG_SESSION_TYPE", "wayland")
             .env("GDK_BACKEND", "wayland")
-            // Force GTK4 / Libadwaita to render into standard wl_shm buffers so our software compositor
-            // can map and composite client surfaces with zero GPU DRM/DMABUF dependencies.
+            // Force GTK4 / Libadwaita and Mesa / Electron to render into standard wl_shm buffers
+            // so our software compositor can map and composite client surfaces cleanly.
             .env("GSK_RENDERER", "cairo")
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
+            .env("GALLIUM_DRIVER", "llvmpipe")
             .env("QT_QPA_PLATFORM", "wayland")
             .env("SDL_VIDEODRIVER", "wayland")
             .env("MOZ_ENABLE_WAYLAND", "1")
+            .env("ELECTRON_OZONE_PLATFORM_HINT", "wayland")
+            .env("OZONE_PLATFORM", "wayland")
             .env("NO_AT_BRIDGE", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("Failed to spawn '{trimmed}': {e}"))?;
+            .map_err(|e| format!("Failed to spawn '{cmd_str}': {e}"))?;
 
         self.children.push(child);
         Ok(())
@@ -318,6 +472,74 @@ impl RealWaylandServer {
         }
     }
 
+    /// Transfers Wayland `wl_keyboard` focus (`leave` old surface, `enter` + `modifiers` new surface).
+    pub fn focus_window_keyboard(&mut self, window_id: Option<u64>) {
+        let target_surf_id = window_id
+            .and_then(|wid| self.state.toplevels.get(&wid))
+            .map(|tl| tl.wl_surface_id.clone());
+        self.state.focus_surface_keyboard(target_surf_id);
+        let _ = self.display.flush_clients();
+    }
+
+    /// Sends a raw Linux evdev key press/release event to the specified Wayland client window.
+    pub fn send_key(&mut self, window_id: u64, evdev_keycode: u32, pressed: bool) {
+        self.focus_window_keyboard(Some(window_id));
+        let Some(tl) = self.state.toplevels.get(&window_id) else {
+            return;
+        };
+        let surf_id = tl.wl_surface_id.clone();
+        let Some(surf) = self.state.surfaces.get(&surf_id) else {
+            return;
+        };
+        let target_client = surf.wl_surface.client();
+        let serial = self.state.next_serial();
+        let time = self.state.elapsed_ms();
+        let key_state = if pressed {
+            wl_keyboard::KeyState::Pressed
+        } else {
+            wl_keyboard::KeyState::Released
+        };
+
+        self.state.keyboards.retain(|kb| kb.is_alive());
+        for kb in &self.state.keyboards {
+            if kb.client() == target_client {
+                kb.key(serial, time, evdev_keycode, key_state);
+            }
+        }
+        let _ = self.display.flush_clients();
+    }
+
+    /// Updates XKB modifier bitmasks (`Shift=1`, `Lock=2`, `Ctrl=4`, `Alt=8`, `Super=64`) and notifies the focused client.
+    pub fn send_modifiers(
+        &mut self,
+        mods_depressed: u32,
+        mods_latched: u32,
+        mods_locked: u32,
+        group: u32,
+    ) {
+        self.state.mods_depressed = mods_depressed;
+        self.state.mods_latched = mods_latched;
+        self.state.mods_locked = mods_locked;
+        self.state.mods_group = group;
+
+        let Some(ref surf_id) = self.state.focused_keyboard_surface else {
+            return;
+        };
+        let Some(surf) = self.state.surfaces.get(surf_id) else {
+            return;
+        };
+        let target_client = surf.wl_surface.client();
+        let serial = self.state.next_serial();
+
+        self.state.keyboards.retain(|kb| kb.is_alive());
+        for kb in &self.state.keyboards {
+            if kb.client() == target_client {
+                kb.modifiers(serial, mods_depressed, mods_latched, mods_locked, group);
+            }
+        }
+        let _ = self.display.flush_clients();
+    }
+
     /// Forwards pointer motion (`(local_x, local_y)` inside the window's content area) to the Wayland client.
     pub fn send_pointer_motion(&mut self, window_id: u64, local_x: f32, local_y: f32) {
         let Some(tl) = self.state.toplevels.get(&window_id) else {
@@ -343,6 +565,7 @@ impl RealWaylandServer {
         };
         let time = self.state.elapsed_ms();
 
+        self.state.pointers.retain(|ptr| ptr.is_alive());
         let target_client = wl_surface.client();
         for ptr in &self.state.pointers {
             if ptr.client() == target_client {
@@ -359,12 +582,24 @@ impl RealWaylandServer {
         let _ = self.display.flush_clients();
     }
 
-    /// Forwards mouse button press/release inside the window's content area to the Wayland client.
+    /// Forwards left mouse button press/release (`0x110`) inside the window's content area to the Wayland client.
     pub fn send_pointer_button(
         &mut self,
         window_id: u64,
         local_x: f32,
         local_y: f32,
+        pressed: bool,
+    ) {
+        self.send_pointer_button_code(window_id, local_x, local_y, 0x110, pressed);
+    }
+
+    /// Forwards any mouse button press/release (`0x110` Left, `0x111` Right, `0x112` Middle) to the Wayland client.
+    pub fn send_pointer_button_code(
+        &mut self,
+        window_id: u64,
+        local_x: f32,
+        local_y: f32,
+        button_code: u32,
         pressed: bool,
     ) {
         self.send_pointer_motion(window_id, local_x, local_y);
@@ -384,11 +619,11 @@ impl RealWaylandServer {
             wl_pointer::ButtonState::Released
         };
 
+        self.state.pointers.retain(|ptr| ptr.is_alive());
         let target_client = wl_surface.client();
         for ptr in &self.state.pointers {
             if ptr.client() == target_client {
-                // BTN_LEFT = 0x110 (272)
-                ptr.button(serial, time, 0x110, btn_state);
+                ptr.button(serial, time, button_code, btn_state);
                 if ptr.version() >= 5 {
                     ptr.frame();
                 }
@@ -396,17 +631,42 @@ impl RealWaylandServer {
         }
 
         // Also give keyboard focus on click
-        if pressed && self.state.focused_keyboard_surface.as_ref() != Some(&surf_id) {
-            let kb_serial = self.state.next_serial();
-            for kb in &self.state.keyboards {
-                if kb.client() == target_client {
-                    kb.enter(kb_serial, &wl_surface, Vec::new());
-                    kb.modifiers(kb_serial, 0, 0, 0, 0);
-                }
-            }
-            self.state.focused_keyboard_surface = Some(surf_id);
+        if pressed {
+            self.state.focus_surface_keyboard(Some(surf_id));
         }
 
+        let _ = self.display.flush_clients();
+    }
+
+    /// Forwards horizontal (`dx`) and vertical (`dy`) scroll wheel / touchpad axis events to the Wayland client.
+    pub fn send_pointer_axis(&mut self, window_id: u64, dx: f32, dy: f32) {
+        if dx == 0.0 && dy == 0.0 {
+            return;
+        }
+        let Some(tl) = self.state.toplevels.get(&window_id) else {
+            return;
+        };
+        let surf_id = tl.wl_surface_id.clone();
+        let Some(surf) = self.state.surfaces.get(&surf_id) else {
+            return;
+        };
+        let target_client = surf.wl_surface.client();
+        let time = self.state.elapsed_ms();
+
+        self.state.pointers.retain(|ptr| ptr.is_alive());
+        for ptr in &self.state.pointers {
+            if ptr.client() == target_client {
+                if dy != 0.0 {
+                    ptr.axis(time, wl_pointer::Axis::VerticalScroll, dy as f64);
+                }
+                if dx != 0.0 {
+                    ptr.axis(time, wl_pointer::Axis::HorizontalScroll, dx as f64);
+                }
+                if ptr.version() >= 5 {
+                    ptr.frame();
+                }
+            }
+        }
         let _ = self.display.flush_clients();
     }
 }
@@ -431,13 +691,225 @@ fn encode_toplevel_states(is_focused: bool) -> Vec<u8> {
     bytes
 }
 
-fn create_minimal_xkb_keymap_file() -> Option<(File, u32)> {
-    const KEYMAP_STR: &[u8] = b"xkb_keymap {\n\
-xkb_keycodes \"minimal\" { minimum = 8; maximum = 255; <ESC> = 9; <RTRN> = 36; <SPCE> = 65; <BKSP> = 22; };\n\
-xkb_types \"minimal\" { virtual_modifiers NumLock; type \"ONE_LEVEL\" { modifiers = none; level_name[Level1] = \"Any\"; }; };\n\
-xkb_compatibility \"minimal\" { interpret Any + AnyOf(all) { action = NoAction(); }; };\n\
-xkb_symbols \"minimal\" { key <ESC> { [ Escape ] }; key <RTRN> { [ Return ] }; key <SPCE> { [ space ] }; key <BKSP> { [ BackSpace ] }; };\n\
+fn try_load_system_xkb_keymap() -> Option<Vec<u8>> {
+    unsafe {
+        let lib_name = std::ffi::CString::new("libxkbcommon.so.0").ok()?;
+        let handle = libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY);
+        if handle.is_null() {
+            return None;
+        }
+
+        type XkbContextNew = unsafe extern "C" fn(u32) -> *mut libc::c_void;
+        type XkbContextUnref = unsafe extern "C" fn(*mut libc::c_void);
+        type XkbKeymapNewFromNames =
+            unsafe extern "C" fn(*mut libc::c_void, *const libc::c_void, u32) -> *mut libc::c_void;
+        type XkbKeymapGetAsString =
+            unsafe extern "C" fn(*mut libc::c_void, u32) -> *mut libc::c_char;
+        type XkbKeymapUnref = unsafe extern "C" fn(*mut libc::c_void);
+
+        let sym = |name: &[u8]| -> Option<*mut libc::c_void> {
+            let ptr = libc::dlsym(handle, name.as_ptr() as *const libc::c_char);
+            if ptr.is_null() {
+                None
+            } else {
+                Some(ptr)
+            }
+        };
+
+        let result = (|| {
+            let ctx_new: XkbContextNew = std::mem::transmute(sym(b"xkb_context_new\0")?);
+            let ctx_unref: XkbContextUnref = std::mem::transmute(sym(b"xkb_context_unref\0")?);
+            let km_new: XkbKeymapNewFromNames =
+                std::mem::transmute(sym(b"xkb_keymap_new_from_names\0")?);
+            let km_str: XkbKeymapGetAsString =
+                std::mem::transmute(sym(b"xkb_keymap_get_as_string\0")?);
+            let km_unref: XkbKeymapUnref = std::mem::transmute(sym(b"xkb_keymap_unref\0")?);
+
+            let ctx = ctx_new(0);
+            if ctx.is_null() {
+                return None;
+            }
+            let km = km_new(ctx, std::ptr::null(), 0);
+            if km.is_null() {
+                ctx_unref(ctx);
+                return None;
+            }
+            // XKB_KEYMAP_FORMAT_TEXT_V1 = 1
+            let c_str = km_str(km, 1);
+            let bytes = if !c_str.is_null() {
+                let slice = std::ffi::CStr::from_ptr(c_str)
+                    .to_bytes_with_nul()
+                    .to_vec();
+                libc::free(c_str as *mut libc::c_void);
+                Some(slice)
+            } else {
+                None
+            };
+            km_unref(km);
+            ctx_unref(ctx);
+            bytes
+        })();
+
+        libc::dlclose(handle);
+        result
+    }
+}
+
+const FALLBACK_FULL_XKB_KEYMAP: &[u8] = b"xkb_keymap {\n\
+xkb_keycodes \"evdev_full\" {\n\
+    minimum = 8;\n\
+    maximum = 255;\n\
+    <ESC> = 9;\n\
+    <AE01> = 10; <AE02> = 11; <AE03> = 12; <AE04> = 13; <AE05> = 14; <AE06> = 15;\n\
+    <AE07> = 16; <AE08> = 17; <AE09> = 18; <AE10> = 19; <AE11> = 20; <AE12> = 21;\n\
+    <BKSP> = 22;\n\
+    <TAB> = 23;\n\
+    <AD01> = 24; <AD02> = 25; <AD03> = 26; <AD04> = 27; <AD05> = 28; <AD06> = 29;\n\
+    <AD07> = 30; <AD08> = 31; <AD09> = 32; <AD10> = 33; <AD11> = 34; <AD12> = 35;\n\
+    <RTRN> = 36;\n\
+    <LCTL> = 37;\n\
+    <AC01> = 38; <AC02> = 39; <AC03> = 40; <AC04> = 41; <AC05> = 42; <AC06> = 43;\n\
+    <AC07> = 44; <AC08> = 45; <AC09> = 46; <AC10> = 47; <AC11> = 48;\n\
+    <TLDE> = 49;\n\
+    <LFSH> = 50;\n\
+    <BKSL> = 51;\n\
+    <AB01> = 52; <AB02> = 53; <AB03> = 54; <AB04> = 55; <AB05> = 56; <AB06> = 57;\n\
+    <AB07> = 58; <AB08> = 59; <AB09> = 60; <AB10> = 61;\n\
+    <RTSH> = 62;\n\
+    <KPMU> = 63;\n\
+    <LALT> = 64;\n\
+    <SPCE> = 65;\n\
+    <CAPS> = 66;\n\
+    <FK01> = 67; <FK02> = 68; <FK03> = 69; <FK04> = 70; <FK05> = 71;\n\
+    <FK06> = 72; <FK07> = 73; <FK08> = 74; <FK09> = 75; <FK10> = 76;\n\
+    <FK11> = 95; <FK12> = 96;\n\
+    <RCTL> = 105;\n\
+    <RALT> = 108;\n\
+    <HOME> = 110; <UP> = 111; <PGUP> = 112; <LEFT> = 113; <RGHT> = 114;\n\
+    <END> = 115; <DOWN> = 116; <PGDN> = 117; <INS> = 118; <DELE> = 119;\n\
+    <LWIN> = 133; <RWIN> = 134;\n\
+};\n\
+xkb_types \"complete\" {\n\
+    virtual_modifiers NumLock,Alt,Super;\n\
+    type \"ONE_LEVEL\" {\n\
+        modifiers = none;\n\
+        level_name[Level1] = \"Any\";\n\
+    };\n\
+    type \"TWO_LEVEL\" {\n\
+        modifiers = Shift;\n\
+        map[Shift] = Level2;\n\
+        level_name[Level1] = \"Base\";\n\
+        level_name[Level2] = \"Shift\";\n\
+    };\n\
+    type \"ALPHABETIC\" {\n\
+        modifiers = Shift+Lock;\n\
+        map[Shift] = Level2;\n\
+        map[Lock] = Level2;\n\
+        level_name[Level1] = \"Base\";\n\
+        level_name[Level2] = \"Caps\";\n\
+    };\n\
+};\n\
+xkb_compatibility \"complete\" {\n\
+    virtual_modifiers NumLock,Alt,Super;\n\
+    interpret Any + AnyOf(all) { action = NoAction(); };\n\
+};\n\
+xkb_symbols \"pc_us\" {\n\
+    name[group1]=\"English (US)\";\n\
+    key <ESC>  { [ Escape ] };\n\
+    key <TLDE> { [ grave, asciitilde ] };\n\
+    key <AE01> { [ 1, exclam ] };\n\
+    key <AE02> { [ 2, at ] };\n\
+    key <AE03> { [ 3, numbersign ] };\n\
+    key <AE04> { [ 4, dollar ] };\n\
+    key <AE05> { [ 5, percent ] };\n\
+    key <AE06> { [ 6, asciicircum ] };\n\
+    key <AE07> { [ 7, ampersand ] };\n\
+    key <AE08> { [ 8, asterisk ] };\n\
+    key <AE09> { [ 9, parenleft ] };\n\
+    key <AE10> { [ 0, parenright ] };\n\
+    key <AE11> { [ minus, underscore ] };\n\
+    key <AE12> { [ equal, plus ] };\n\
+    key <BKSP> { [ BackSpace, BackSpace ] };\n\
+    key <TAB>  { [ Tab, ISO_Left_Tab ] };\n\
+    key <AD01> { [ q, Q ] };\n\
+    key <AD02> { [ w, W ] };\n\
+    key <AD03> { [ e, E ] };\n\
+    key <AD04> { [ r, R ] };\n\
+    key <AD05> { [ t, T ] };\n\
+    key <AD06> { [ y, Y ] };\n\
+    key <AD07> { [ u, U ] };\n\
+    key <AD08> { [ i, I ] };\n\
+    key <AD09> { [ o, O ] };\n\
+    key <AD10> { [ p, P ] };\n\
+    key <AD11> { [ bracketleft, braceleft ] };\n\
+    key <AD12> { [ bracketright, braceright ] };\n\
+    key <RTRN> { [ Return ] };\n\
+    key <LCTL> { [ Control_L ] };\n\
+    key <AC01> { [ a, A ] };\n\
+    key <AC02> { [ s, S ] };\n\
+    key <AC03> { [ d, D ] };\n\
+    key <AC04> { [ f, F ] };\n\
+    key <AC05> { [ g, G ] };\n\
+    key <AC06> { [ h, H ] };\n\
+    key <AC07> { [ j, J ] };\n\
+    key <AC08> { [ k, K ] };\n\
+    key <AC09> { [ l, L ] };\n\
+    key <AC10> { [ semicolon, colon ] };\n\
+    key <AC11> { [ apostrophe, quotedbl ] };\n\
+    key <LFSH> { [ Shift_L ] };\n\
+    key <BKSL> { [ backslash, bar ] };\n\
+    key <AB01> { [ z, Z ] };\n\
+    key <AB02> { [ x, X ] };\n\
+    key <AB03> { [ c, C ] };\n\
+    key <AB04> { [ v, V ] };\n\
+    key <AB05> { [ b, B ] };\n\
+    key <AB06> { [ n, N ] };\n\
+    key <AB07> { [ m, M ] };\n\
+    key <AB08> { [ comma, less ] };\n\
+    key <AB09> { [ period, greater ] };\n\
+    key <AB10> { [ slash, question ] };\n\
+    key <RTSH> { [ Shift_R ] };\n\
+    key <KPMU> { [ KP_Multiply ] };\n\
+    key <LALT> { [ Alt_L, Meta_L ] };\n\
+    key <SPCE> { [ space ] };\n\
+    key <CAPS> { [ Caps_Lock ] };\n\
+    key <FK01> { [ F1 ] };\n\
+    key <FK02> { [ F2 ] };\n\
+    key <FK03> { [ F3 ] };\n\
+    key <FK04> { [ F4 ] };\n\
+    key <FK05> { [ F5 ] };\n\
+    key <FK06> { [ F6 ] };\n\
+    key <FK07> { [ F7 ] };\n\
+    key <FK08> { [ F8 ] };\n\
+    key <FK09> { [ F9 ] };\n\
+    key <FK10> { [ F10 ] };\n\
+    key <FK11> { [ F11 ] };\n\
+    key <FK12> { [ F12 ] };\n\
+    key <RCTL> { [ Control_R ] };\n\
+    key <RALT> { [ Alt_R, Meta_R ] };\n\
+    key <HOME> { [ Home ] };\n\
+    key <UP>   { [ Up ] };\n\
+    key <PGUP> { [ Prior ] };\n\
+    key <LEFT> { [ Left ] };\n\
+    key <RGHT> { [ Right ] };\n\
+    key <END>  { [ End ] };\n\
+    key <DOWN> { [ Down ] };\n\
+    key <PGDN> { [ Next ] };\n\
+    key <INS>  { [ Insert ] };\n\
+    key <DELE> { [ Delete ] };\n\
+    key <LWIN> { [ Super_L ] };\n\
+    key <RWIN> { [ Super_R ] };\n\
+    modifier_map Shift   { <LFSH>, <RTSH> };\n\
+    modifier_map Lock    { <CAPS> };\n\
+    modifier_map Control { <LCTL>, <RCTL> };\n\
+    modifier_map Mod1    { <LALT>, <RALT> };\n\
+    modifier_map Mod4    { <LWIN>, <RWIN> };\n\
+};\n\
 };\0";
+
+fn create_full_xkb_keymap_file() -> Option<(File, u32)> {
+    let keymap_bytes =
+        try_load_system_xkb_keymap().unwrap_or_else(|| FALLBACK_FULL_XKB_KEYMAP.to_vec());
     let path = std::env::temp_dir().join(format!("lumina-xkb-keymap-{}", std::process::id()));
     let mut file = std::fs::OpenOptions::new()
         .create(true)
@@ -447,9 +919,9 @@ xkb_symbols \"minimal\" { key <ESC> { [ Escape ] }; key <RTRN> { [ Return ] }; k
         .open(&path)
         .ok()?;
     let _ = std::fs::remove_file(&path);
-    file.write_all(KEYMAP_STR).ok()?;
+    file.write_all(&keymap_bytes).ok()?;
     file.seek(SeekFrom::Start(0)).ok()?;
-    Some((file, KEYMAP_STR.len() as u32))
+    Some((file, keymap_bytes.len() as u32))
 }
 
 // ============================================================================
@@ -872,7 +1344,7 @@ impl Dispatch<WlBuffer, ShmBufferUserData> for WaylandState {
 
 impl GlobalDispatch<WlOutput, ()> for WaylandState {
     fn bind(
-        _state: &mut Self,
+        state: &mut Self,
         _handle: &DisplayHandle,
         _client: &Client,
         resource: New<WlOutput>,
@@ -892,14 +1364,15 @@ impl GlobalDispatch<WlOutput, ()> for WaylandState {
         );
         output.mode(
             wl_output::Mode::Current | wl_output::Mode::Preferred,
-            1920,
-            1080,
+            state.output_width,
+            state.output_height,
             60000,
         );
         if output.version() >= 2 {
-            output.scale(1);
+            output.scale(state.output_scale);
             output.done();
         }
+        state.outputs.push(output);
     }
 }
 
@@ -955,6 +1428,25 @@ impl Dispatch<WlSeat, ()> for WaylandState {
                 }
                 if kb.version() >= 4 {
                     kb.repeat_info(25, 400);
+                }
+                // If the currently focused keyboard surface belongs to this client, send enter immediately
+                let focused_wl_surf = state
+                    .focused_keyboard_surface
+                    .as_ref()
+                    .and_then(|sid| state.surfaces.get(sid))
+                    .map(|s| s.wl_surface.clone());
+                if let Some(wl_surf) = focused_wl_surf {
+                    if wl_surf.client() == kb.client() {
+                        let serial = state.next_serial();
+                        kb.enter(serial, &wl_surf, Vec::new());
+                        kb.modifiers(
+                            serial,
+                            state.mods_depressed,
+                            state.mods_latched,
+                            state.mods_locked,
+                            state.mods_group,
+                        );
+                    }
                 }
                 state.keyboards.push(kb);
             }
@@ -1186,6 +1678,9 @@ impl Dispatch<XdgSurface, XdgSurfaceUserData> for WaylandState {
                 toplevel.configure(900, 620, encode_toplevel_states(true));
                 resource.configure(serial);
 
+                // Automatically focus the newly created toplevel's surface for keyboard input
+                state.focus_surface_keyboard(Some(data.wl_surface_id.clone()));
+
                 state.events.push(WaylandCompositorEvent::WindowOpened {
                     window_id: win_id,
                     title: default_title,
@@ -1338,3 +1833,50 @@ impl Dispatch<ZxdgToplevelDecorationV1, ()> for WaylandState {
         }
     }
 }
+
+// ============================================================================
+// WpViewporter & WpViewport
+// ============================================================================
+
+impl GlobalDispatch<WpViewporter, ()> for WaylandState {
+    fn bind(
+        _state: &mut Self,
+        _handle: &DisplayHandle,
+        _client: &Client,
+        resource: New<WpViewporter>,
+        _global_data: &(),
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        data_init.init(resource, ());
+    }
+}
+
+impl Dispatch<WpViewporter, ()> for WaylandState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WpViewporter,
+        request: wp_viewporter::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        if let wp_viewporter::Request::GetViewport { id, .. } = request {
+            data_init.init(id, ());
+        }
+    }
+}
+
+impl Dispatch<WpViewport, ()> for WaylandState {
+    fn request(
+        _state: &mut Self,
+        _client: &Client,
+        _resource: &WpViewport,
+        _request: wp_viewport::Request,
+        _data: &(),
+        _dhandle: &DisplayHandle,
+        _data_init: &mut DataInit<'_, Self>,
+    ) {
+    }
+}
+
