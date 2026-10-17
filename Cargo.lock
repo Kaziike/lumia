@@ -2254,6 +2254,7 @@ dependencies = [
  "wayland-backend",
  "wayland-client",
  "wayland-scanner",
+ "wayland-server",
 ]
 
 [[package]]
@@ -2291,6 +2292,19 @@ dependencies = [
  "proc-macro2",
  "quick-xml",
  "quote",
+]
+
+[[package]]
+name = "wayland-server"
+version = "0.31.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0dde9c29be0f723a573977de51ee455bf3dfa03652730a74f9dd3b337e374d75"
+dependencies = [
+ "bitflags 2.13.2",
+ "downcast-rs",
+ "rustix 1.1.5",
+ "wayland-backend",
+ "wayland-scanner",
 ]
 
 [[package]]
@@ -2573,6 +2587,8 @@ dependencies = [
  "html-dom",
  "ipc-server",
  "layout-engine",
+ "libc",
+ "memmap2",
  "reactive-state",
  "renderer",
  "serde",
@@ -2581,6 +2597,8 @@ dependencies = [
  "sys-providers",
  "tracing",
  "tracing-subscriber",
+ "wayland-protocols",
+ "wayland-server",
  "winit",
  "wm-core",
  "wm-proto",

@@ -51,16 +51,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = LuminaDaemonArgs::parse();
     let sock_path = args.socket.clone().unwrap_or_else(default_socket_path);
 
-    // If a screenshot was requested as a single shot
+    // If a screenshot was requested as a single shot (or multi-frame Wayland capture)
     if let Some(ref shot_path) = args.screenshot {
         let mut daemon = LuminaDaemon::new();
         daemon.assets_dir = Some(args.assets.clone());
+        let frames = args.headless_frames.unwrap_or(1);
+        if frames > 1 {
+            daemon.clear_startup_windows();
+            let _ = daemon.enable_wayland_server();
+        }
         let _ = daemon.set_theme(&args.theme);
         for dsl in &args.dispatch {
             if let Ok(cmds) = ActionCommand::parse_dsl_list(dsl) {
                 for cmd in cmds {
                     let _ = daemon.dispatch_action(cmd);
                 }
+            }
+        }
+        if frames > 1 {
+            for _ in 0..frames {
+                let _ = daemon.poll_wayland_clients();
+                let _ = daemon.render_desktop_frame();
+                thread::sleep(Duration::from_millis(20));
             }
         }
         match daemon.save_desktop_screenshot(shot_path) {
@@ -78,7 +90,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
         }
-        if args.headless_frames == Some(1) {
+        if args.headless || args.headless_frames.is_some() {
             return Ok(());
         }
     }

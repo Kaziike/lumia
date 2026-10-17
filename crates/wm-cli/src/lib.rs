@@ -1,9 +1,11 @@
 pub mod cli;
 pub mod daemon;
 pub mod nested;
+pub mod wayland_compositor;
 
 pub use cli::*;
 pub use nested::NestedApp;
+pub use wayland_compositor::{RealWaylandServer, WaylandCompositorEvent};
 pub use css_style;
 pub use daemon::LuminaDaemon;
 pub use html_dom;

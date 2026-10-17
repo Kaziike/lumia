@@ -1,3 +1,4 @@
+use crate::wayland_compositor::{RealWaylandServer, WaylandCompositorEvent};
 use css_style::CssStyleEngine;
 use html_dom::{DomDocument, DomEventKind};
 use ipc_server::{AssetWatcher, IpcError, IpcServer, IpcServerHandle};
@@ -14,6 +15,7 @@ use wm_proto::{
     IpcPayload, IpcRequest, IpcResponse, LayoutBox, LayoutSolver, NodeId, Point,
     Rect, ReloadTarget, ShellAction, Size, StatePatch, StateProvider, StateValue, StyleEngine,
     SurfaceMetadata, SurfaceRenderer, WidgetStatus, WindowDescriptor, WindowManagerEngine,
+    WmAction,
 };
 
 const DEFAULT_TOPBAR_HTML: &str = include_str!("../../../assets/topbar.html");
@@ -23,6 +25,19 @@ const DEFAULT_QUICK_SETTINGS_HTML: &str = include_str!("../../../assets/quick_se
 const DEFAULT_WINDOW_DEC_HTML: &str = include_str!("../../../assets/window_decoration.html");
 const DEFAULT_CATPPUCCIN_CSS: &str = include_str!("../../../assets/css/theme-catppuccin.css");
 const DEFAULT_CYBERPUNK_CSS: &str = include_str!("../../../assets/css/theme-cyberpunk.css");
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WindowCacheKey {
+    width: u32,
+    height: u32,
+    is_focused: bool,
+    is_floating: bool,
+    is_fullscreen: bool,
+    is_urgent: bool,
+    title: String,
+    client_serial: u64,
+    terminal_rev: u64,
+}
 
 /// Live HTML+CSS surface instance managed by `LuminaDaemon`.
 pub struct LiveSurface {
@@ -34,6 +49,7 @@ pub struct LiveSurface {
     pub viewport: Size,
     pub visible: bool,
     pub layer: String,
+    pub dirty: bool,
     pub last_frame: Option<FrameBuffer>,
 }
 
@@ -42,6 +58,7 @@ pub struct LiveSurface {
 pub struct LuminaDaemon {
     pub wm: LuminaWmCore,
     pub compositor: WaylandCompositorHost,
+    pub wayland_server: Option<RealWaylandServer>,
     pub store: StateStore,
     pub sys_providers: SystemProviderManager,
     pub style_engine: CssStyleEngine,
@@ -54,6 +71,11 @@ pub struct LuminaDaemon {
     pub current_theme: String,
     pub assets_dir: Option<PathBuf>,
     pub reload_count: u64,
+    pub terminal_lines: Vec<String>,
+    pub terminal_input: String,
+    pub terminal_rev: u64,
+    cached_wallpaper: Option<(String, FrameBuffer)>,
+    window_frame_cache: HashMap<u64, (WindowCacheKey, FrameBuffer)>,
 }
 
 impl Default for LuminaDaemon {
@@ -78,7 +100,7 @@ impl LuminaDaemon {
         // Register default HTML/CSS layer-shell topbar surface
         compositor.register_layer_surface(&mut wm, SurfaceMetadata::default(), None);
 
-        // Seed default desktop windows so fresh daemon has rich initial state
+        // Seed default windows for headless/CLI testing (cleared in interactive nested mode via `clear_startup_windows`)
         wm.on_window_opened(WindowDescriptor {
             id: 101,
             title: "Lumina Terminal — zsh (cargo test --workspace)".to_string(),
@@ -130,6 +152,7 @@ impl LuminaDaemon {
         let mut daemon = Self {
             wm,
             compositor,
+            wayland_server: None,
             store,
             sys_providers,
             style_engine,
@@ -142,6 +165,11 @@ impl LuminaDaemon {
             current_theme: "catppuccin".to_string(),
             assets_dir: None,
             reload_count: 0,
+            terminal_lines: Vec::new(),
+            terminal_input: String::new(),
+            terminal_rev: 1,
+            cached_wallpaper: None,
+            window_frame_cache: HashMap::new(),
         };
 
         // Sync initial WM state into store
@@ -153,6 +181,74 @@ impl LuminaDaemon {
         daemon.recompute_all_surfaces();
 
         daemon
+    }
+
+    /// Removes all pre-seeded windows so an interactive session starts with a clean desktop.
+    pub fn clear_startup_windows(&mut self) {
+        self.window_frame_cache.clear();
+        let patches = self.wm.clear_all_windows();
+        self.apply_state_patches(patches);
+    }
+
+    /// Starts the embedded `RealWaylandServer` so real Wayland client applications can connect
+    /// and render their `wl_shm` surfaces inside Lumina WM.
+    pub fn enable_wayland_server(&mut self) -> Result<String, String> {
+        let server = RealWaylandServer::new()?;
+        let sock = server.socket_name().to_string();
+        self.wayland_server = Some(server);
+        Ok(sock)
+    }
+
+    /// Polls connected Wayland client applications, handling new windows, title changes, frame commits, and closes.
+    pub fn poll_wayland_clients(&mut self) -> bool {
+        let Some(ref mut wl) = self.wayland_server else {
+            return false;
+        };
+        let events = wl.poll();
+        if events.is_empty() {
+            return false;
+        }
+        let mut patches = Vec::new();
+        for ev in events {
+            match ev {
+                WaylandCompositorEvent::WindowOpened {
+                    window_id,
+                    title,
+                    app_id,
+                } => {
+                    patches.extend(self.wm.on_window_opened(WindowDescriptor {
+                        id: window_id,
+                        title,
+                        app_id: app_id.clone(),
+                        icon: app_id,
+                        workspace_id: self.wm.active_workspace_id(),
+                        is_focused: true,
+                        is_floating: false,
+                        is_fullscreen: false,
+                        is_maximized: false,
+                        is_minimized: false,
+                        is_urgent: false,
+                        rect: Rect::default(),
+                    }));
+                }
+                WaylandCompositorEvent::WindowUpdated {
+                    window_id,
+                    title,
+                    app_id,
+                } => {
+                    patches.extend(self.wm.update_window_metadata(window_id, title, app_id));
+                }
+                WaylandCompositorEvent::WindowClosed { window_id } => {
+                    self.window_frame_cache.remove(&window_id);
+                    patches.extend(self.wm.on_window_closed(window_id));
+                }
+                WaylandCompositorEvent::WindowFrameCommitted { .. } => {}
+            }
+        }
+        if !patches.is_empty() {
+            self.apply_state_patches(patches);
+        }
+        true
     }
 
     fn load_builtin_surfaces(&mut self) {
@@ -199,6 +295,7 @@ impl LuminaDaemon {
                     viewport,
                     visible,
                     layer: layer.to_string(),
+                    dirty: true,
                     last_frame: None,
                 },
             );
@@ -232,8 +329,7 @@ impl LuminaDaemon {
         }
     }
 
-    /// Re-runs reactive DOM synchronization, CSS cascade, and Taffy Flexbox/Grid layout
-    /// across all registered HTML surfaces.
+    /// Marks all HTML surfaces dirty and recomputes reactive DOM, CSS cascade, and Taffy layout.
     pub fn recompute_all_surfaces(&mut self) {
         for (name, surf) in &mut self.surfaces {
             surf.dom.sync_reactive_state(&self.store);
@@ -241,6 +337,7 @@ impl LuminaDaemon {
             surf.layouts = self
                 .layout_engine
                 .compute_layout(&surf.dom, &surf.styles, surf.viewport);
+            surf.dirty = true;
             if let Some(w) = self.widgets.get_mut(name) {
                 w.node_count = surf.dom.all_node_ids().len();
                 w.visible = surf.visible;
@@ -248,9 +345,15 @@ impl LuminaDaemon {
         }
     }
 
-    /// Renders a specific HTML/CSS surface into an RGBA8 `FrameBuffer`.
+    /// Renders a specific HTML/CSS surface into an RGBA8 `FrameBuffer`, utilizing surface frame caching
+    /// when `surf.dirty == false` for sub-millisecond compositing.
     pub fn render_surface(&mut self, name: &str) -> Option<FrameBuffer> {
         let surf = self.surfaces.get_mut(name)?;
+        if !surf.dirty {
+            if let Some(ref cached) = surf.last_frame {
+                return Some(cached.clone());
+            }
+        }
         surf.dom.sync_reactive_state(&self.store);
         surf.styles = self.style_engine.compute_styles(&surf.dom);
         surf.layouts =
@@ -260,13 +363,66 @@ impl LuminaDaemon {
             .renderer
             .render_surface(&surf.dom, &surf.styles, &surf.layouts, surf.viewport);
         surf.last_frame = Some(fb.clone());
+        surf.dirty = false;
         Some(fb)
+    }
+
+    /// Updates `:hover` state on a named HTML surface and returns `true` if the hovered element changed.
+    pub fn update_hover(&mut self, surface_name: &str, x: f32, y: f32) -> bool {
+        let Some(surf) = self.surfaces.get_mut(surface_name) else {
+            return false;
+        };
+        let hit = if x >= 0.0
+            && y >= 0.0
+            && x <= surf.viewport.width
+            && y <= surf.viewport.height
+        {
+            self.layout_engine
+                .hit_test(&surf.dom, &surf.layouts, Point::new(x, y))
+        } else {
+            None
+        };
+        let changed = surf.dom.update_hover_chain(hit);
+        if changed {
+            surf.styles = self.style_engine.compute_styles(&surf.dom);
+            surf.layouts =
+                self.layout_engine
+                    .compute_layout(&surf.dom, &surf.styles, surf.viewport);
+            surf.dirty = true;
+        }
+        changed
     }
 
     /// Dispatches a pointer click at `(x, y)` on a named HTML surface, performing
     /// Taffy hit-testing, DOM event bubbling, and executing any triggered `ActionCommand`s!
     pub fn click_surface(&mut self, surface_name: &str, x: f32, y: f32) -> Result<Vec<String>, String> {
-        let (hit_node, actions) = {
+        self.dispatch_surface_event(surface_name, x, y, DomEventKind::Click)
+    }
+
+    /// Dispatches a scroll event (`ScrollUp` or `ScrollDown`) at `(x, y)` on a named HTML surface.
+    pub fn scroll_surface(
+        &mut self,
+        surface_name: &str,
+        x: f32,
+        y: f32,
+        scroll_up: bool,
+    ) -> Result<Vec<String>, String> {
+        let kind = if scroll_up {
+            DomEventKind::ScrollUp
+        } else {
+            DomEventKind::ScrollDown
+        };
+        self.dispatch_surface_event(surface_name, x, y, kind)
+    }
+
+    fn dispatch_surface_event(
+        &mut self,
+        surface_name: &str,
+        x: f32,
+        y: f32,
+        event_kind: DomEventKind,
+    ) -> Result<Vec<String>, String> {
+        let actions = {
             let surf = self
                 .surfaces
                 .get(surface_name)
@@ -277,12 +433,9 @@ impl LuminaDaemon {
             else {
                 return Ok(Vec::new());
             };
-            let cmds = surf
-                .dom
-                .dispatch_dom_event(node_id, DomEventKind::Click, &self.store);
-            (node_id, cmds)
+            surf.dom
+                .dispatch_dom_event(node_id, event_kind, &self.store)
         };
-        let _ = hit_node;
         let mut results = Vec::new();
         for cmd in actions {
             results.push(self.dispatch_action(cmd)?);
@@ -290,16 +443,73 @@ impl LuminaDaemon {
         Ok(results)
     }
 
-    /// Composites a complete 1920x1080 desktop screenshot (Wallpaper + Tiled/Floating Windows
-    /// with CSS Server-Side Decorations + Topbar + Dock + Active Overlays like Launcher/QuickSettings).
-    pub fn render_desktop_frame(&mut self) -> FrameBuffer {
-        self.recompute_all_surfaces();
+    /// Appends typed text to the interactive Terminal window buffer.
+    pub fn terminal_push_str(&mut self, s: &str) {
+        let mut changed = false;
+        for ch in s.chars() {
+            if !ch.is_control() {
+                self.terminal_input.push(ch);
+                changed = true;
+            }
+        }
+        if changed {
+            self.terminal_rev = self.terminal_rev.wrapping_add(1);
+        }
+    }
 
-        let width = 1920u32;
-        let height = 1080u32;
+    /// Deletes the last character in the interactive Terminal window buffer.
+    pub fn terminal_backspace(&mut self) {
+        if self.terminal_input.pop().is_some() {
+            self.terminal_rev = self.terminal_rev.wrapping_add(1);
+        }
+    }
+
+    /// Executes the current `terminal_input` command inside the focused Terminal window.
+    pub fn terminal_execute(&mut self) {
+        self.terminal_rev = self.terminal_rev.wrapping_add(1);
+        let cmd = self.terminal_input.trim().to_string();
+        self.terminal_input.clear();
+        self.terminal_lines.push(format!("kaz@lumina-wm ➜ ~ $ {cmd}"));
+        if cmd.is_empty() {
+            return;
+        }
+        if cmd == "clear" {
+            self.terminal_lines.clear();
+            return;
+        }
+        if cmd == "help" {
+            self.terminal_lines.push(
+                "Built-in commands: clear, help, status, workspaces, windows, or any shell command (ls, uname -a, date)".to_string(),
+            );
+            return;
+        }
+        // Run non-blocking shell command with short output limit
+        if let Ok(output) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            for line in stdout.lines().chain(stderr.lines()).take(10) {
+                self.terminal_lines.push(line.to_string());
+            }
+        } else {
+            self.terminal_lines
+                .push(format!("zsh: command failed: {cmd}"));
+        }
+        while self.terminal_lines.len() > 14 {
+            self.terminal_lines.remove(0);
+        }
+    }
+
+    fn get_or_build_wallpaper(&mut self, width: u32, height: u32) -> FrameBuffer {
+        if let Some((ref theme, ref fb)) = self.cached_wallpaper {
+            if theme == &self.current_theme && fb.width == width && fb.height == height {
+                return fb.clone();
+            }
+        }
         let mut desktop = FrameBuffer::new(width, height);
-
-        // 1. Paint desktop background gradient (Catppuccin or Cyberpunk)
         let is_cyber = self.current_theme.contains("cyber");
         for y in 0..height {
             let t = y as f32 / height as f32;
@@ -316,16 +526,29 @@ impl LuminaDaemon {
                     (27.0 + t * 22.0) as u8,
                 )
             };
-            for x in 0..width {
-                let idx = ((y * width + x) * 4) as usize;
+            let row_start = (y * width * 4) as usize;
+            for x in 0..width as usize {
+                let idx = row_start + x * 4;
                 desktop.pixels[idx] = r;
                 desktop.pixels[idx + 1] = g;
                 desktop.pixels[idx + 2] = b;
                 desktop.pixels[idx + 3] = 255;
             }
         }
+        self.cached_wallpaper = Some((self.current_theme.clone(), desktop.clone()));
+        desktop
+    }
 
-        // 2. Render tiled/floating windows on active workspace with Server-Side Decorations
+    /// Composites a complete 1920x1080 desktop screenshot (Wallpaper + Tiled/Floating Windows
+    /// with CSS Server-Side Decorations & Application UIs + Topbar + Dock + Active Overlays).
+    pub fn render_desktop_frame(&mut self) -> FrameBuffer {
+        let width = 1920u32;
+        let height = 1080u32;
+
+        // 1. Copy cached desktop background gradient
+        let mut desktop = self.get_or_build_wallpaper(width, height);
+
+        // 2. Render tiled/floating windows on active workspace with Server-Side Decorations + App Client UI
         let usable = self
             .wm
             .outputs()
@@ -345,17 +568,81 @@ impl LuminaDaemon {
             let title = win_desc
                 .map(|w| w.title.as_str())
                 .unwrap_or("Wayland Window");
+            let app_id = win_desc
+                .map(|w| w.app_id.as_str())
+                .unwrap_or("org.lumina.app");
             let is_urgent = win_desc.map(|w| w.is_urgent).unwrap_or(false);
 
-            let win_fb = self
-                .renderer
-                .render_window_decoration(placement, title, is_urgent, None);
-            blit_framebuffer(
-                &mut desktop,
-                &win_fb,
-                placement.frame_rect.x.round() as i32,
-                placement.frame_rect.y.round() as i32,
-            );
+            let content_w = placement.content_rect.width.round().max(100.0) as u32;
+            let content_h = placement.content_rect.height.round().max(100.0) as u32;
+            if let Some(ref mut wl) = self.wayland_server {
+                wl.configure_window(
+                    placement.window_id,
+                    content_w,
+                    content_h,
+                    placement.is_focused,
+                );
+            }
+
+            let client_serial = self
+                .wayland_server
+                .as_ref()
+                .and_then(|wl| wl.window_frame(placement.window_id))
+                .map(|(_, serial)| serial)
+                .unwrap_or(0);
+
+            let cache_key = WindowCacheKey {
+                width: placement.frame_rect.width.round().max(1.0) as u32,
+                height: placement.frame_rect.height.round().max(1.0) as u32,
+                is_focused: placement.is_focused,
+                is_floating: placement.is_floating,
+                is_fullscreen: placement.is_fullscreen,
+                is_urgent,
+                title: title.to_string(),
+                client_serial,
+                terminal_rev: if app_id.contains("term") {
+                    self.terminal_rev
+                } else {
+                    0
+                },
+            };
+
+            let cache_hit = self
+                .window_frame_cache
+                .get(&placement.window_id)
+                .map(|(k, _)| k == &cache_key)
+                .unwrap_or(false);
+
+            if !cache_hit {
+                let client_fb = self
+                    .wayland_server
+                    .as_ref()
+                    .and_then(|wl| wl.window_frame(placement.window_id))
+                    .map(|(fb, _)| fb);
+
+                let win_fb = renderer::render_window_with_client_buffer(
+                    self.renderer.font_manager(),
+                    placement,
+                    app_id,
+                    title,
+                    is_urgent,
+                    client_fb.as_deref(),
+                    &self.terminal_lines,
+                    &self.terminal_input,
+                    None,
+                );
+                self.window_frame_cache
+                    .insert(placement.window_id, (cache_key, win_fb));
+            }
+
+            if let Some((_, ref win_fb)) = self.window_frame_cache.get(&placement.window_id) {
+                blit_framebuffer(
+                    &mut desktop,
+                    win_fb,
+                    placement.frame_rect.x.round() as i32,
+                    placement.frame_rect.y.round() as i32,
+                );
+            }
         }
 
         // 3. Render Topbar (`topbar` at (0, 0))
@@ -414,6 +701,9 @@ impl LuminaDaemon {
     }
 
     pub fn apply_state_patches(&mut self, patches: Vec<StatePatch>) {
+        if patches.is_empty() {
+            return;
+        }
         self.store.apply_patches(patches);
         // Keep convenient aliases synced
         if let Some(vol) = self.store.get("sys.audio.percent") {
@@ -461,6 +751,8 @@ impl LuminaDaemon {
             self.style_engine.set_custom_property(k, v);
         }
         self.current_theme = theme_name.to_string();
+        self.cached_wallpaper = None;
+        self.window_frame_cache.clear();
         self.store
             .set("shell.theme", StateValue::String(theme_name.to_string()));
         self.recompute_all_surfaces();
@@ -484,6 +776,7 @@ impl LuminaDaemon {
             }
             if let Some(s) = self.surfaces.get_mut(alias) {
                 s.visible = final_vis;
+                s.dirty = true;
             }
         }
         if found {
@@ -496,6 +789,14 @@ impl LuminaDaemon {
     pub fn dispatch_action(&mut self, action: ActionCommand) -> Result<String, String> {
         match action {
             ActionCommand::Wm(wm_act) => {
+                if let WmAction::CloseWindow { id } = &wm_act {
+                    if let Some(target_id) = id.or_else(|| self.wm.focused_window_id()) {
+                        self.window_frame_cache.remove(&target_id);
+                        if let Some(ref mut wl) = self.wayland_server {
+                            wl.close_window(target_id);
+                        }
+                    }
+                }
                 let patches = self.wm.dispatch_wm_action(&wm_act)?;
                 if let Some(w) = self.widgets.get_mut("overview") {
                     w.visible = self.wm.overview_open();
@@ -535,25 +836,34 @@ impl LuminaDaemon {
                 Ok(format!("Dispatched system action: {action:?}"))
             }
             ActionCommand::Apps(ref apps_act) => {
+                let launched_id = match apps_act {
+                    wm_proto::AppsAction::Launch { app_id } => Some(app_id.clone()),
+                    wm_proto::AppsAction::LaunchSelected => {
+                        let idx = self
+                            .store
+                            .get("apps.selected_idx")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(0)
+                            .max(0) as usize;
+                        self.store
+                            .get("apps.filtered")
+                            .and_then(|v| match v {
+                                StateValue::List(list) => list.get(idx).cloned(),
+                                _ => None,
+                            })
+                            .and_then(|item| match item {
+                                StateValue::Map(m) => m
+                                    .get("id")
+                                    .and_then(|v| v.as_str().map(|s| s.to_string())),
+                                _ => None,
+                            })
+                    }
+                    _ => None,
+                };
                 let patches = self.sys_providers.handle_action(&action)?;
                 self.apply_state_patches(patches);
-                if let wm_proto::AppsAction::Launch { app_id } = apps_act {
-                    let new_id = (self.wm.windows().len() as u64) + 200;
-                    let wm_patches = self.wm.on_window_opened(WindowDescriptor {
-                        id: new_id,
-                        title: app_id.clone(),
-                        app_id: app_id.clone(),
-                        icon: app_id.clone(),
-                        workspace_id: self.wm.active_workspace_id(),
-                        is_focused: true,
-                        is_floating: false,
-                        is_fullscreen: false,
-                        is_maximized: false,
-                        is_minimized: false,
-                        is_urgent: false,
-                        rect: Rect::default(),
-                    });
-                    self.apply_state_patches(wm_patches);
+                if let Some(app_id) = launched_id {
+                    self.spawn_app_window(&app_id);
                 }
                 Ok(format!("Dispatched apps action: {apps_act:?}"))
             }
@@ -563,9 +873,109 @@ impl LuminaDaemon {
                 Ok(format!("Applied state action: {state_act:?}"))
             }
             ActionCommand::Exec { command, args } => {
+                let full_cmd = if args.is_empty() {
+                    command.clone()
+                } else {
+                    format!("{command} {}", args.join(" "))
+                };
+                self.spawn_app_window(&full_cmd);
                 Ok(format!("Exec command '{command}' with args {args:?}"))
             }
         }
+    }
+
+    fn spawn_app_window(&mut self, app_id: &str) {
+        let lower = app_id.to_ascii_lowercase();
+
+        // If the embedded Wayland server is active and the user launched a real desktop app
+        // (not the built-in Lumina Terminal), spawn the real Wayland client binary!
+        let is_builtin_terminal = lower == "org.lumina.terminal"
+            || lower == "alacritty"
+            || lower == "terminal";
+
+        if !is_builtin_terminal && self.wayland_server.is_some() {
+            let exec_cmd = self
+                .sys_providers
+                .apps
+                .find_app(app_id)
+                .map(|entry| entry.exec.clone())
+                .unwrap_or_else(|| app_id.to_string());
+
+            if let Some(ref mut wl) = self.wayland_server {
+                if wl.spawn_client(&exec_cmd).is_ok() {
+                    return;
+                }
+            }
+        }
+
+        let (title, icon, effective_app_id) = if is_builtin_terminal
+            || lower.contains("term")
+            || lower.contains("alacritty")
+            || lower.contains("kitty")
+            || lower.contains("foot")
+        {
+            (
+                "Lumina Terminal — zsh (~/scratch/lumina-wm)".to_string(),
+                "terminal".to_string(),
+                "org.lumina.terminal".to_string(),
+            )
+        } else if lower.contains("firefox")
+            || lower.contains("chrome")
+            || lower.contains("browser")
+            || lower.contains("web")
+        {
+            (
+                "Mozilla Firefox — Lumina Wayland HTML+CSS Architecture".to_string(),
+                "firefox".to_string(),
+                app_id.to_string(),
+            )
+        } else if lower.contains("nautilus")
+            || lower.contains("files")
+            || lower.contains("thunar")
+            || lower.contains("dolphin")
+        {
+            (
+                "Files — ~/scratch/lumina-wm".to_string(),
+                "files".to_string(),
+                app_id.to_string(),
+            )
+        } else if lower.contains("code")
+            || lower.contains("zed")
+            || lower.contains("nvim")
+            || lower.contains("editor")
+        {
+            (
+                "Zed Editor — crates/wm-cli/src/daemon.rs".to_string(),
+                "code".to_string(),
+                app_id.to_string(),
+            )
+        } else {
+            (app_id.to_string(), app_id.to_string(), app_id.to_string())
+        };
+
+        let next_id = self
+            .wm
+            .windows()
+            .iter()
+            .map(|w| w.id)
+            .max()
+            .unwrap_or(200)
+            + 1;
+        let wm_patches = self.wm.on_window_opened(WindowDescriptor {
+            id: next_id,
+            title,
+            app_id: effective_app_id,
+            icon,
+            workspace_id: self.wm.active_workspace_id(),
+            is_focused: true,
+            is_floating: false,
+            is_fullscreen: false,
+            is_maximized: false,
+            is_minimized: false,
+            is_urgent: false,
+            rect: Rect::default(),
+        });
+        self.apply_state_patches(wm_patches);
     }
 
     pub fn reload_from_disk(&mut self, kind: ReloadTarget) {
@@ -823,35 +1233,39 @@ fn blit_framebuffer(dst: &mut FrameBuffer, src: &FrameBuffer, offset_x: i32, off
     let src_w = src.width as i32;
     let src_h = src.height as i32;
 
-    for sy in 0..src_h {
-        let dy = offset_y + sy;
-        if dy < 0 || dy >= dst_h {
-            continue;
-        }
-        for sx in 0..src_w {
-            let dx = offset_x + sx;
-            if dx < 0 || dx >= dst_w {
-                continue;
-            }
-            let s_idx = ((sy * src_w + sx) * 4) as usize;
-            let d_idx = ((dy * dst_w + dx) * 4) as usize;
+    let sx_start = (-offset_x).max(0);
+    let sy_start = (-offset_y).max(0);
+    let sx_end = (dst_w - offset_x).min(src_w);
+    let sy_end = (dst_h - offset_y).min(src_h);
+    if sx_start >= sx_end || sy_start >= sy_end {
+        return;
+    }
 
-            let sa = src.pixels[s_idx + 3] as u32;
+    let dst_stride = (dst_w as usize) * 4;
+    let src_stride = (src_w as usize) * 4;
+    let span_bytes = ((sx_end - sx_start) as usize) * 4;
+
+    for sy in sy_start..sy_end {
+        let dy = (offset_y + sy) as usize;
+        let s_row_start = (sy as usize) * src_stride + (sx_start as usize) * 4;
+        let d_row_start = dy * dst_stride + ((offset_x + sx_start) as usize) * 4;
+
+        let src_slice = &src.pixels[s_row_start..s_row_start + span_bytes];
+        let dst_slice = &mut dst.pixels[d_row_start..d_row_start + span_bytes];
+
+        for (sp, dp) in src_slice.chunks_exact(4).zip(dst_slice.chunks_exact_mut(4)) {
+            let sa = sp[3] as u32;
             if sa == 0 {
                 continue;
             }
             if sa == 255 {
-                dst.pixels[d_idx..d_idx + 4].copy_from_slice(&src.pixels[s_idx..s_idx + 4]);
+                dp.copy_from_slice(sp);
             } else {
                 let inv_a = 255 - sa;
-                for c in 0..3 {
-                    let sv = src.pixels[s_idx + c] as u32;
-                    let dv = dst.pixels[d_idx + c] as u32;
-                    // Premultiplied or straight alpha blend
-                    let out = (sv + (dv * inv_a) / 255).min(255) as u8;
-                    dst.pixels[d_idx + c] = out;
-                }
-                dst.pixels[d_idx + 3] = 255;
+                dp[0] = ((sp[0] as u32) + ((dp[0] as u32) * inv_a) / 255).min(255) as u8;
+                dp[1] = ((sp[1] as u32) + ((dp[1] as u32) * inv_a) / 255).min(255) as u8;
+                dp[2] = ((sp[2] as u32) + ((dp[2] as u32) * inv_a) / 255).min(255) as u8;
+                dp[3] = 255;
             }
         }
     }

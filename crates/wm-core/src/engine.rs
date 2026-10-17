@@ -224,8 +224,52 @@ impl LuminaWmCore {
         self.export_state_patches()
     }
 
+    /// Fast O(1) update of interactive window position without building state patches on every mouse motion event.
+    pub fn move_interactive_grab_fast(&mut self, dx: f32, dy: f32) -> bool {
+        let Some(InteractiveGrab::Move { win_id, start_rect }) = self.interactive_grab else {
+            return false;
+        };
+        if let Some(win) = self.windows.iter_mut().find(|w| w.id == win_id) {
+            win.is_floating = true;
+            win.rect = Rect::new(
+                start_rect.x + dx,
+                start_rect.y + dy,
+                start_rect.width,
+                start_rect.height,
+            );
+            self.saved_floating_rects.insert(win_id, win.rect);
+            return true;
+        }
+        false
+    }
+
     pub fn end_interactive_grab(&mut self) {
         self.interactive_grab = None;
+    }
+
+    pub fn update_window_metadata(
+        &mut self,
+        win_id: WindowId,
+        title: String,
+        app_id: String,
+    ) -> Vec<StatePatch> {
+        if let Some(win) = self.windows.iter_mut().find(|w| w.id == win_id) {
+            win.title = title;
+            win.app_id = app_id.clone();
+            win.icon = app_id;
+        }
+        self.export_state_patches()
+    }
+
+    pub fn clear_all_windows(&mut self) -> Vec<StatePatch> {
+        self.windows.clear();
+        self.scrolling_ratios.clear();
+        self.saved_floating_rects.clear();
+        self.floating_z_stack.clear();
+        self.workspace_focus_history.clear();
+        self.interactive_grab = None;
+        self.sync_workspace_and_window_geometries();
+        self.export_state_patches()
     }
 
     /// Adds or replaces a display output descriptor.

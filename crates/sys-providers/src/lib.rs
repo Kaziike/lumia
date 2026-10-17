@@ -1171,16 +1171,26 @@ impl AppsProvider {
             }
         }
 
-        for fallback in Self::default_fallback_apps() {
-            by_id.entry(fallback.id.clone()).or_insert(fallback);
+        if by_id.is_empty() {
+            for fallback in Self::default_fallback_apps() {
+                by_id.entry(fallback.id.clone()).or_insert(fallback);
+            }
         }
 
         let mut list: Vec<DesktopAppEntry> = by_id.into_values().collect();
-        list.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        list.sort_by(|a, b| {
+            app_priority_rank(&a.id)
+                .cmp(&app_priority_rank(&b.id))
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
         list
     }
 
     pub fn parse_desktop_entry(id: &str, content: &str) -> Option<DesktopAppEntry> {
+        if is_unwanted_desktop_id(id) {
+            return None;
+        }
+
         let mut in_desktop_entry = false;
         let mut name = None;
         let mut generic_name = None;
@@ -1190,6 +1200,7 @@ impl AppsProvider {
         let mut categories = String::new();
         let mut no_display = false;
         let mut hidden = false;
+        let mut is_terminal_cli = false;
 
         for raw_line in content.lines() {
             let line = raw_line.trim();
@@ -1217,11 +1228,12 @@ impl AppsProvider {
                 "Categories" => categories = val.to_string(),
                 "NoDisplay" => no_display = val.eq_ignore_ascii_case("true"),
                 "Hidden" => hidden = val.eq_ignore_ascii_case("true"),
+                "Terminal" => is_terminal_cli = val.eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
 
-        if no_display || hidden {
+        if no_display || hidden || is_terminal_cli {
             return None;
         }
         let name = name?;
@@ -1345,6 +1357,79 @@ impl AppsProvider {
             fields,
         }]
     }
+
+    pub fn find_app(&self, app_id_or_name: &str) -> Option<&DesktopAppEntry> {
+        let key = app_id_or_name.trim().trim_end_matches(".desktop");
+        self.all.iter().find(|a| {
+            a.id.eq_ignore_ascii_case(key)
+                || a.exec.eq_ignore_ascii_case(key)
+                || a.name.eq_ignore_ascii_case(key)
+        })
+    }
+}
+
+fn is_unwanted_desktop_id(id: &str) -> bool {
+    let lower = id.to_ascii_lowercase();
+    if lower.starts_with("waydroid.")
+        || lower.starts_with("wine-extension-")
+        || lower == "wine"
+        || lower.starts_with("org.freedesktop.ibus")
+        || lower.starts_with("xdg-desktop-portal")
+        || lower.ends_with("-handler")
+        || lower.ends_with("-previewer")
+        || lower.ends_with("-panel")
+        || lower.contains("autorun")
+        || lower.contains("url-handler")
+    {
+        return true;
+    }
+    matches!(
+        lower.as_str(),
+        "avahi-discover"
+            | "bssh"
+            | "bvnc"
+            | "lstopo"
+            | "qv4l2"
+            | "qvidcap"
+            | "xgps"
+            | "xgpsspeed"
+            | "java-java-openjdk"
+            | "user-dirs-update-gtk"
+            | "gcm-import"
+            | "gcm-picker"
+            | "gcr-prompter"
+            | "gcr-viewer"
+            | "geoclue-demo-agent"
+            | "geoclue-where-am-i"
+            | "org.freedesktop.xwayland"
+            | "org.gnome.zenty"
+            | "org.gnome.zenity"
+            | "org.gnupg.pinentry-qt"
+            | "polkit-gnome-authentication-agent-1"
+            | "bluetooth-sendto"
+            | "arch-update-tray"
+            | "com.cloudflare.warptaskbar"
+            | "com.shellyorg.shelly-notifications"
+            | "org.gnome.shell.calendarserver"
+            | "org.gnome.shell.portalhelper"
+            | "org.gnome.onlineaccounts.oauth2"
+            | "org.gnome.goa-daemon"
+    )
+}
+
+fn app_priority_rank(id: &str) -> u8 {
+    let lower = id.to_ascii_lowercase();
+    if lower.contains("alacritty") || lower.contains("ptyxis") || lower.contains("terminal") {
+        0
+    } else if lower.contains("nautilus") || lower.contains("texteditor") || lower.contains("calculator") {
+        1
+    } else if lower.contains("resources") || lower.contains("decibels") || lower.contains("loupe") || lower.contains("papers") || lower.contains("evince") {
+        2
+    } else if lower.contains("firefox") || lower.contains("brave") {
+        3
+    } else {
+        5
+    }
 }
 
 fn clean_exec_command(raw: &str) -> String {
@@ -1353,6 +1438,7 @@ fn clean_exec_command(raw: &str) -> String {
         .collect::<Vec<&str>>()
         .join(" ")
 }
+
 
 fn fuzzy_score_app(app: &DesktopAppEntry, q: &str) -> Option<i32> {
     let name_l = app.name.to_lowercase();

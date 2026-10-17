@@ -9,7 +9,9 @@ pub use icons::{detect_icon_name, draw_vector_icon};
 pub use primitives::{build_rounded_rect_path, draw_background, draw_border, draw_box_shadow};
 pub use snapshot::{encode_bmp, encode_ppm, save_bmp, save_ppm};
 pub use window_decoration::{
-    render_window_decoration, render_window_decoration_with_theme, WindowDecorationTheme,
+    hit_test_titlebar, render_window_decoration, render_window_decoration_with_theme,
+    render_window_with_app_content, render_window_with_client_buffer, TitlebarHit,
+    WindowDecorationTheme,
 };
 pub use wm_proto;
 
