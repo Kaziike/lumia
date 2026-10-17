@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod daemon;
+pub mod nested;
 
 pub use cli::*;
+pub use nested::NestedApp;
 pub use css_style;
 pub use daemon::LuminaDaemon;
 pub use html_dom;

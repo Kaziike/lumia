@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use wm_cli::daemon::LuminaDaemon;
+use wm_cli::nested::NestedApp;
 use wm_proto::ActionCommand;
 
 #[derive(Parser, Debug)]
@@ -33,37 +34,35 @@ struct LuminaDaemonArgs {
     #[arg(long)]
     screenshot: Option<PathBuf>,
 
+    /// Run as headless daemon without opening an interactive nested window
+    #[arg(long)]
+    headless: bool,
+
     /// Optional number of frames to run before exiting (for headless testing/CI)
     #[arg(long)]
     headless_frames: Option<u64>,
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .try_init();
 
     let args = LuminaDaemonArgs::parse();
-    let sock_path = args.socket.unwrap_or_else(default_socket_path);
+    let sock_path = args.socket.clone().unwrap_or_else(default_socket_path);
 
-    let mut daemon = LuminaDaemon::new();
-    daemon.assets_dir = Some(args.assets.clone());
-    if let Err(e) = daemon.set_theme(&args.theme) {
-        eprintln!("Warning: failed to load theme '{}': {e}", args.theme);
-    }
-
-    for dsl in &args.dispatch {
-        match ActionCommand::parse_dsl_list(dsl) {
-            Ok(cmds) => {
+    // If a screenshot was requested as a single shot
+    if let Some(ref shot_path) = args.screenshot {
+        let mut daemon = LuminaDaemon::new();
+        daemon.assets_dir = Some(args.assets.clone());
+        let _ = daemon.set_theme(&args.theme);
+        for dsl in &args.dispatch {
+            if let Ok(cmds) = ActionCommand::parse_dsl_list(dsl) {
                 for cmd in cmds {
                     let _ = daemon.dispatch_action(cmd);
                 }
             }
-            Err(e) => eprintln!("Warning: invalid --dispatch '{dsl}': {e}"),
         }
-    }
-
-    if let Some(ref shot_path) = args.screenshot {
         match daemon.save_desktop_screenshot(shot_path) {
             Ok(fb) => {
                 println!(
@@ -79,6 +78,27 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        if args.headless_frames == Some(1) {
+            return Ok(());
+        }
+    }
+
+    // Interactive nested mode if not explicitly headless and no frame limit was given
+    if !args.headless && args.headless_frames.is_none() {
+        let app = NestedApp::new(args.socket, args.assets, args.theme, args.dispatch);
+        return app.run();
+    }
+
+    // Headless loop fallback
+    let mut daemon = LuminaDaemon::new();
+    daemon.assets_dir = Some(args.assets.clone());
+    let _ = daemon.set_theme(&args.theme);
+    for dsl in &args.dispatch {
+        if let Ok(cmds) = ActionCommand::parse_dsl_list(dsl) {
+            for cmd in cmds {
+                let _ = daemon.dispatch_action(cmd);
+            }
+        }
     }
 
     let mut ipc_server = match IpcServer::bind(&sock_path) {
@@ -91,9 +111,8 @@ fn main() {
     let mut watcher = AssetWatcher::new(&args.assets);
 
     tracing::info!(
-        "lumina-wm listening on IPC socket {:?} (wayland display: {})",
-        ipc_server.socket_path(),
-        daemon.compositor.display_socket_name()
+        "lumina-wm listening on IPC socket {:?} (headless mode)",
+        ipc_server.socket_path()
     );
 
     let mut frame = 0u64;
@@ -111,4 +130,6 @@ fn main() {
         }
         thread::sleep(Duration::from_millis(16));
     }
+
+    Ok(())
 }
