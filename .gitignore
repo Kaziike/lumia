@@ -1,1 +1,40 @@
+# Rust build artifacts
+/target/
 target/
+**/*.rs.bk
+*.bk
+
+# Lumina runtime sockets & IPC temporary files
+*.sock
+*.socket
+/tmp/lumina-*
+
+# Temporary test screenshots & raw image dumps (keep assets/ intact)
+*.bmp
+*.ppm
+screenshot*.png
+desktop*.bmp
+desktop*.png
+
+# Logs and debug traces
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Editor & IDE configurations
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.iml
+
+# OS and filesystem artifacts
+.DS_Store
+Thumbs.db
+
+# Backup and swap files
+*.swp
+*.swo
+*~
+.#*
