@@ -9,7 +9,11 @@ use smithay::{
     },
     desktop::layer_map_for_output,
     output::{Mode, Scale},
-    reexports::wayland_server::Display,
+    reexports::{
+        wayland_server::Display,
+        winit::{dpi::LogicalSize, window::Window as WinitWindow},
+    },
+    utils::Transform,
     wayland::socket::ListeningSocketSource,
 };
 use tracing::{error, info, warn};
@@ -45,14 +49,26 @@ pub fn run_winit_compositor(
         "Lumina Smithay compositor listening for Wayland client connections"
     );
 
-    let (mut backend, winit_evt_loop) = winit::init::<GlesRenderer>()
+    let in_cage = std::env::var("LUMINA_IN_CAGE").is_ok();
+    let (init_w, init_h) = shell.output_size();
+    let window_attrs = WinitWindow::default_attributes()
+        .with_title("Lumina WM — Pure-Rust HTML/CSS Wayland Compositor")
+        .with_inner_size(LogicalSize::new(init_w as f64, init_h as f64))
+        .with_maximized(true)
+        .with_decorations(!in_cage)
+        .with_visible(true);
+
+    let (mut backend, winit_evt_loop) = winit::init_from_attributes::<GlesRenderer>(window_attrs)
         .map_err(|e| format!("Failed to initialize Smithay winit + EGL/GLES backend: {e}"))?;
 
     let mut state = LuminaState::new(&display, socket_name, shell);
 
-    // Sync initial winit window dimensions with Output and LuminaShell
+    // Sync initial winit window dimensions with Output and LuminaShell.
+    // Note: Smithay's winit EGL backend requires `Transform::Flipped180` so OpenGL's
+    // bottom-left framebuffer origin maps `(0, 0)` to the top-left of the window,
+    // and we use a 1:1 physical pixel scale (`1.0`) so LuminaShell's pixel-exact
+    // HTML/CSS surfaces (`topbar`, `dock`, `launcher`, `quick_settings`) match the window.
     let init_size = backend.window_size();
-    let init_scale = backend.scale_factor();
     if init_size.w > 0 && init_size.h > 0 {
         let mode = Mode {
             size: init_size,
@@ -60,17 +76,24 @@ pub fn run_winit_compositor(
         };
         state.output.change_current_state(
             Some(mode),
-            None,
-            Some(Scale::Fractional(init_scale)),
+            Some(Transform::Flipped180),
+            Some(Scale::Fractional(1.0)),
             None,
         );
         state.output.set_preferred(mode);
         state.shell.resize_output(
             init_size.w as u32,
             init_size.h as u32,
-            init_scale as f32,
+            1.0,
         );
         state.sync_from_shell();
+    } else {
+        state.output.change_current_state(
+            None,
+            Some(Transform::Flipped180),
+            Some(Scale::Fractional(1.0)),
+            None,
+        );
     }
 
     let mut damage_tracker = OutputDamageTracker::from_output(&state.output);
@@ -81,7 +104,7 @@ pub fn run_winit_compositor(
 
     loop_handle
         .insert_source(winit_evt_loop, move |event, _, state| match event {
-            WinitEvent::Resized { size, scale_factor } => {
+            WinitEvent::Resized { size, .. } => {
                 if size.w > 0 && size.h > 0 {
                     let mode = Mode {
                         size,
@@ -89,14 +112,14 @@ pub fn run_winit_compositor(
                     };
                     state.output.change_current_state(
                         Some(mode),
-                        None,
-                        Some(Scale::Fractional(scale_factor)),
+                        Some(Transform::Flipped180),
+                        Some(Scale::Fractional(1.0)),
                         None,
                     );
                     state.shell.resize_output(
                         size.w as u32,
                         size.h as u32,
-                        scale_factor as f32,
+                        1.0,
                     );
                     layer_map_for_output(&state.output).arrange();
                     state.sync_from_shell();
@@ -156,18 +179,20 @@ fn render_winit_frame(
     state: &mut LuminaState,
 ) {
     let elements = state.collect_render_elements(backend.renderer());
-    let age = backend.buffer_age().unwrap_or(0);
 
+    // Pass `age = 0` rather than querying `backend.buffer_age()` before `GlesRenderer::render`,
+    // because `import_memory` binds `EGL_NO_SURFACE` and `eglQuerySurface(EGL_BUFFER_AGE_EXT)`
+    // emits `EGL_BAD_SURFACE (0x300d)` whenever the EGLSurface is not currently bound.
     let render_outcome = backend.bind().and_then(|(renderer, mut framebuffer)| {
         damage_tracker
             .render_output(
                 renderer,
                 &mut framebuffer,
-                age,
+                0,
                 &elements,
                 [0.043, 0.059, 0.098, 1.0],
             )
-            .map(|res| res.damage.cloned())
+            .map(|_| ())
             .map_err(|err| match err {
                 smithay::backend::renderer::damage::Error::Rendering(e) => e.into(),
                 smithay::backend::renderer::damage::Error::OutputNoMode(_) => {
@@ -179,8 +204,8 @@ fn render_winit_frame(
     });
 
     match render_outcome {
-        Ok(damage) => {
-            if let Err(err) = backend.submit(damage.as_deref()) {
+        Ok(()) => {
+            if let Err(err) = backend.submit(None) {
                 warn!("Failed to submit EGL frame to winit surface: {err}");
             }
         }
