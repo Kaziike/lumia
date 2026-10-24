@@ -816,10 +816,16 @@ impl AudioProvider {
             "sink_name".to_string(),
             StateValue::String(self.sink_name.clone()),
         );
-        vec![StatePatch::Merge {
-            path: self.namespace().to_string(),
-            fields,
-        }]
+        vec![
+            StatePatch::Merge {
+                path: self.namespace().to_string(),
+                fields,
+            },
+            StatePatch::Set {
+                path: "sys.brightness.percent".to_string(),
+                value: StateValue::Int(self.brightness_percent as i64),
+            },
+        ]
     }
 }
 
@@ -895,9 +901,26 @@ impl StateProvider for AudioProvider {
                     value: StateValue::Int(self.brightness_percent as i64),
                 }])
             }
+            SysAction::ChangeBrightness { delta } => {
+                self.brightness_percent =
+                    (self.brightness_percent as i16 + *delta as i16).clamp(10, 100) as u8;
+                Ok(self.build_patches())
+            }
             SysAction::SetResolution { width, height } => Ok(vec![StatePatch::Set {
                 path: "sys.display.resolution".to_string(),
                 value: StateValue::String(format!("{width}x{height}")),
+            }]),
+            SysAction::Logout => Ok(vec![StatePatch::Set {
+                path: "sys.session.exit_requested".to_string(),
+                value: StateValue::Bool(true),
+            }]),
+            SysAction::Reboot => Ok(vec![StatePatch::Set {
+                path: "sys.session.power_action".to_string(),
+                value: StateValue::String("reboot".to_string()),
+            }]),
+            SysAction::PowerOff => Ok(vec![StatePatch::Set {
+                path: "sys.session.power_action".to_string(),
+                value: StateValue::String("poweroff".to_string()),
             }]),
         }
     }
@@ -1032,6 +1055,12 @@ impl NetworkProvider {
             "interface".to_string(),
             StateValue::String(self.interface.clone()),
         );
+        let ssid = if self.connected && self.interface != "none" {
+            self.interface.clone()
+        } else {
+            "Offline".to_string()
+        };
+        fields.insert("ssid".to_string(), StateValue::String(ssid));
         fields.insert("kind".to_string(), StateValue::String(self.kind.clone()));
         fields.insert("rx_kbps".to_string(), StateValue::Float(self.rx_kbps));
         fields.insert("tx_kbps".to_string(), StateValue::Float(self.tx_kbps));
@@ -1091,6 +1120,13 @@ impl DesktopAppEntry {
             "categories".to_string(),
             StateValue::String(self.categories.clone()),
         );
+        let primary_cat = self
+            .categories
+            .split(';')
+            .find(|c| !c.trim().is_empty())
+            .unwrap_or("App")
+            .to_string();
+        m.insert("category".to_string(), StateValue::String(primary_cat));
         StateValue::Map(m)
     }
 }
@@ -1339,8 +1375,21 @@ impl AppsProvider {
 
     fn build_patches(&self) -> Vec<StatePatch> {
         let all_vals: Vec<StateValue> = self.all.iter().map(|a| a.to_state_value()).collect();
-        let filtered_vals: Vec<StateValue> =
-            self.filtered.iter().map(|a| a.to_state_value()).collect();
+        let filtered_vals: Vec<StateValue> = self
+            .filtered
+            .iter()
+            .enumerate()
+            .map(|(idx, a)| {
+                let mut val = a.to_state_value();
+                if let StateValue::Map(ref mut m) = val {
+                    m.insert(
+                        "is_selected".to_string(),
+                        StateValue::Bool(idx == self.selected_idx),
+                    );
+                }
+                val
+            })
+            .collect();
         let mut fields = BTreeMap::new();
         fields.insert("query".to_string(), StateValue::String(self.query.clone()));
         fields.insert(
@@ -1423,7 +1472,13 @@ fn is_unwanted_desktop_id(id: &str) -> bool {
 
 fn app_priority_rank(id: &str) -> u8 {
     let lower = id.to_ascii_lowercase();
-    if lower.contains("alacritty") || lower.contains("ptyxis") || lower.contains("terminal") {
+    if lower.contains("antigravity")
+        || lower.contains("console")
+        || lower.contains("kgx")
+        || lower.contains("alacritty")
+        || lower.contains("ptyxis")
+        || lower.contains("terminal")
+    {
         0
     } else if lower.contains("nautilus") || lower.contains("texteditor") || lower.contains("calculator") {
         1
@@ -1519,10 +1574,7 @@ impl StateProvider for AppsProvider {
                     let next = (self.selected_idx as i32 + delta).rem_euclid(len) as usize;
                     self.selected_idx = next;
                 }
-                Ok(vec![StatePatch::Set {
-                    path: "apps.selected_idx".to_string(),
-                    value: StateValue::Int(self.selected_idx as i64),
-                }])
+                Ok(self.build_patches())
             }
             AppsAction::Launch { app_id } => {
                 let target = self
@@ -1942,6 +1994,26 @@ mod tests {
             .unwrap();
         store.apply_patches(patches);
         assert_eq!(store.get("sys.audio.muted"), Some(StateValue::Bool(true)));
+
+        let patches = audio
+            .handle_action(&ActionCommand::Sys(SysAction::ChangeBrightness {
+                delta: -10,
+            }))
+            .unwrap();
+        store.apply_patches(patches);
+        assert_eq!(
+            store.get("sys.brightness.percent"),
+            Some(StateValue::Int(70))
+        );
+
+        let patches = audio
+            .handle_action(&ActionCommand::Sys(SysAction::Logout))
+            .unwrap();
+        store.apply_patches(patches);
+        assert_eq!(
+            store.get("sys.session.exit_requested"),
+            Some(StateValue::Bool(true))
+        );
     }
 
     #[test]
@@ -1952,6 +2024,29 @@ mod tests {
 
         let total = store.get("apps.all.len").and_then(|v| v.as_i64()).unwrap();
         assert!(total >= 5);
+        assert_eq!(
+            store.get("apps.filtered.0.is_selected"),
+            Some(StateValue::Bool(true))
+        );
+        assert_eq!(
+            store.get("apps.filtered.1.is_selected"),
+            Some(StateValue::Bool(false))
+        );
+
+        let patches = apps
+            .handle_action(&ActionCommand::Apps(AppsAction::SelectRelative {
+                delta: 1,
+            }))
+            .unwrap();
+        store.apply_patches(patches);
+        assert_eq!(
+            store.get("apps.filtered.0.is_selected"),
+            Some(StateValue::Bool(false))
+        );
+        assert_eq!(
+            store.get("apps.filtered.1.is_selected"),
+            Some(StateValue::Bool(true))
+        );
 
         // Fuzzy query for firefox
         let patches = apps

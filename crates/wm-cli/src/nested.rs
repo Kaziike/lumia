@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ipc_server::{default_socket_path, AssetWatcher, IpcServer};
-use renderer::{hit_test_titlebar, TitlebarHit};
+use renderer::{hit_test_resize_edge, hit_test_titlebar, TitlebarHit};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -12,8 +12,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 use wm_proto::{
-    ActionCommand, AppsAction, Point, Rect, ShellAction, WindowManagerEngine, WmAction,
-    WorkspaceTarget,
+    ActionCommand, AppsAction, Direction, Edges, Point, Rect, ResizeEdge, ShellAction,
+    WindowManagerEngine, WmAction, WorkspaceTarget,
 };
 use crate::daemon::LuminaDaemon;
 
@@ -256,11 +256,26 @@ impl NestedApp {
             .get("quick_settings")
             .map(|w| w.visible)
             .unwrap_or(false);
+        let (qs_w, _qs_h) = daemon
+            .widgets
+            .get("quick_settings")
+            .map(|w| (w.width as f32, w.height as f32))
+            .unwrap_or((380.0, 560.0));
         if qs_visible {
-            let qx = dw - 380.0 - 16.0;
+            let qx = dw - qs_w - 16.0;
             let qy = 54.0;
             hover_changed |=
                 daemon.update_hover("quick_settings", desktop_pt.x - qx, desktop_pt.y - qy);
+        } else if daemon
+            .surfaces
+            .get("notifications")
+            .map(|s| s.visible)
+            .unwrap_or(false)
+        {
+            let qx = dw - 360.0 - 16.0;
+            let qy = 54.0;
+            hover_changed |=
+                daemon.update_hover("notifications", desktop_pt.x - qx, desktop_pt.y - qy);
         }
 
         hover_changed |= daemon.update_hover("topbar", desktop_pt.x, desktop_pt.y);
@@ -334,16 +349,21 @@ impl NestedApp {
                 return;
             }
 
-            // 2. Check if Quick Settings modal is open (top-right 380x520)
+            // 2. Check if Quick Settings modal is open (top-right)
             let qs_visible = daemon
                 .widgets
                 .get("quick_settings")
                 .map(|w| w.visible)
                 .unwrap_or(false);
+            let (qs_w, qs_h) = daemon
+                .widgets
+                .get("quick_settings")
+                .map(|w| (w.width as f32, w.height as f32))
+                .unwrap_or((380.0, 560.0));
             if qs_visible {
-                let qx = dw - 380.0 - 16.0;
+                let qx = dw - qs_w - 16.0;
                 let qy = 54.0;
-                let modal_rect = Rect::new(qx, qy, 380.0, 520.0);
+                let modal_rect = Rect::new(qx, qy, qs_w, qs_h);
                 if modal_rect.contains(desktop_pt) {
                     let _ = daemon.click_surface("quick_settings", x - qx, y - qy);
                 } else {
@@ -353,6 +373,23 @@ impl NestedApp {
                 }
                 self.request_redraw();
                 return;
+            }
+
+            // 2b. Check if notifications toast widget is visible at top-right (!qs_visible)
+            if daemon
+                .surfaces
+                .get("notifications")
+                .map(|s| s.visible)
+                .unwrap_or(false)
+            {
+                let qx = dw - 360.0 - 16.0;
+                let qy = 54.0;
+                let notif_rect = Rect::new(qx, qy, 360.0, 110.0);
+                if notif_rect.contains(desktop_pt) {
+                    let _ = daemon.click_surface("notifications", x - qx, y - qy);
+                    self.request_redraw();
+                    return;
+                }
             }
 
             // 3. Topbar: y < 44
@@ -382,7 +419,7 @@ impl NestedApp {
             }
         }
 
-        // 5. Window Frame / Server-Side Titlebar buttons & Client Area
+        // 5. Window Frame / Server-Side Titlebar buttons, 8-Edge Resize & Client Area
         let usable = daemon
             .wm
             .outputs()
@@ -392,7 +429,7 @@ impl NestedApp {
         let placements = daemon.wm.compute_window_placements(usable);
 
         for p in placements.iter().rev() {
-            if p.frame_rect.contains(desktop_pt) {
+            if p.frame_rect.inset(Edges::all(-4.0)).contains(desktop_pt) {
                 // Focus clicked window first
                 if !p.is_focused {
                     let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWindow {
@@ -403,44 +440,84 @@ impl NestedApp {
                     wl.focus_window_keyboard(Some(p.window_id));
                 }
 
-                // Check server-side titlebar hit (Float, Maximize, Close, or DragArea)
+                // Super + Left Click anywhere inside window starts interactive move
+                if self.modifiers.super_key() && button == MouseButton::Left {
+                    let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveMove {
+                        win_id: p.window_id,
+                    });
+                    self.drag_state = Some(DragState {
+                        start_desktop_pt: desktop_pt,
+                    });
+                    self.request_redraw();
+                    return;
+                }
+
+                // Super + Right Click anywhere inside window starts interactive resize (BottomRight)
+                if self.modifiers.super_key() && button == MouseButton::Right {
+                    let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveResize {
+                        win_id: p.window_id,
+                        edge: ResizeEdge::BottomRight,
+                    });
+                    self.drag_state = Some(DragState {
+                        start_desktop_pt: desktop_pt,
+                    });
+                    self.request_redraw();
+                    return;
+                }
+
+                // Normal Left Click: check titlebar buttons, 8-edge resize border, or titlebar drag
                 if button == MouseButton::Left {
-                    if let Some(hit) = hit_test_titlebar(p, desktop_pt) {
-                        match hit {
-                            TitlebarHit::Float => {
-                                let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                    WmAction::ToggleFloating {
-                                        id: Some(p.window_id),
-                                    },
-                                ));
-                            }
-                            TitlebarHit::Maximize => {
-                                let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                    WmAction::ToggleMaximize {
-                                        id: Some(p.window_id),
-                                    },
-                                ));
-                            }
-                            TitlebarHit::Close => {
-                                let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                    WmAction::CloseWindow {
-                                        id: Some(p.window_id),
-                                    },
-                                ));
-                            }
-                            TitlebarHit::DragArea => {
-                                if p.is_floating {
-                                    let _ = daemon.wm.dispatch_wm_action(
-                                        &WmAction::BeginInteractiveMove {
-                                            win_id: p.window_id,
-                                        },
-                                    );
-                                    self.drag_state = Some(DragState {
-                                        start_desktop_pt: desktop_pt,
-                                    });
-                                }
-                            }
+                    let tb_hit = hit_test_titlebar(p, desktop_pt);
+                    match tb_hit {
+                        Some(TitlebarHit::Float) => {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::ToggleFloating {
+                                    id: Some(p.window_id),
+                                },
+                            ));
+                            self.request_redraw();
+                            return;
                         }
+                        Some(TitlebarHit::Maximize) => {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::ToggleMaximize {
+                                    id: Some(p.window_id),
+                                },
+                            ));
+                            self.request_redraw();
+                            return;
+                        }
+                        Some(TitlebarHit::Close) => {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::CloseWindow {
+                                    id: Some(p.window_id),
+                                },
+                            ));
+                            self.request_redraw();
+                            return;
+                        }
+                        _ => {}
+                    }
+
+                    if let Some(edge) = hit_test_resize_edge(p, desktop_pt) {
+                        let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveResize {
+                            win_id: p.window_id,
+                            edge,
+                        });
+                        self.drag_state = Some(DragState {
+                            start_desktop_pt: desktop_pt,
+                        });
+                        self.request_redraw();
+                        return;
+                    }
+
+                    if matches!(tb_hit, Some(TitlebarHit::DragArea)) {
+                        let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveMove {
+                            win_id: p.window_id,
+                        });
+                        self.drag_state = Some(DragState {
+                            start_desktop_pt: desktop_pt,
+                        });
                         self.request_redraw();
                         return;
                     }
@@ -520,6 +597,145 @@ impl NestedApp {
 
         // Global WM shortcuts on key press
         if pressed {
+            // Alt + Space toggles Launcher
+            if self.modifiers.alt_key() && matches!(key_event.logical_key, Key::Named(NamedKey::Space)) {
+                let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::ToggleWidget {
+                    name: "launcher".to_string(),
+                    args: Default::default(),
+                }));
+                self.request_redraw();
+                return;
+            }
+
+            // Alt + F4 closes focused window
+            if self.modifiers.alt_key() && matches!(key_event.logical_key, Key::Named(NamedKey::F4)) {
+                let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::CloseWindow {
+                    id: None,
+                }));
+                self.request_redraw();
+                return;
+            }
+
+            // Super + <key> shortcuts
+            if self.modifiers.super_key() && !matches!(key_event.logical_key, Key::Named(NamedKey::Super)) {
+                // Close launcher if it was opened when Super key was pressed down
+                if launcher_open {
+                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
+                        name: "launcher".to_string(),
+                    }));
+                }
+
+                if let PhysicalKey::Code(code) = key_event.physical_key {
+                    let ws_idx = match code {
+                        KeyCode::Digit1 => Some(1),
+                        KeyCode::Digit2 => Some(2),
+                        KeyCode::Digit3 => Some(3),
+                        KeyCode::Digit4 => Some(4),
+                        KeyCode::Digit5 => Some(5),
+                        KeyCode::Digit6 => Some(6),
+                        KeyCode::Digit7 => Some(7),
+                        KeyCode::Digit8 => Some(8),
+                        KeyCode::Digit9 => Some(9),
+                        _ => None,
+                    };
+                    if let Some(idx) = ws_idx {
+                        if self.modifiers.shift_key() {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::MoveWindowToWorkspace {
+                                    win_id: None,
+                                    workspace: WorkspaceTarget::Index(idx),
+                                },
+                            ));
+                        } else {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::FocusWorkspace {
+                                    target: WorkspaceTarget::Index(idx),
+                                },
+                            ));
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
+
+                match &key_event.logical_key {
+                    Key::Named(NamedKey::Enter) => {
+                        let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::Launch {
+                            app_id: "org.gnome.Console".to_string(),
+                        }));
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("q") => {
+                        let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::CloseWindow {
+                            id: None,
+                        }));
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("f") => {
+                        if self.modifiers.shift_key() {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::ToggleFullscreen { id: None },
+                            ));
+                        } else {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::ToggleMaximize { id: None },
+                            ));
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Character(c) if c.eq_ignore_ascii_case("v") => {
+                        let _ = daemon.dispatch_action(ActionCommand::Wm(
+                            WmAction::ToggleFloating { id: None },
+                        ));
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Space) => {
+                        let _ = daemon.dispatch_action(ActionCommand::Wm(
+                            WmAction::CycleLayoutMode,
+                        ));
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Named(
+                         k @ (NamedKey::ArrowLeft
+                        | NamedKey::ArrowRight
+                        | NamedKey::ArrowUp
+                        | NamedKey::ArrowDown),
+                    ) => {
+                        let dir = match k {
+                            NamedKey::ArrowLeft => Direction::Left,
+                            NamedKey::ArrowRight => Direction::Right,
+                            NamedKey::ArrowUp => Direction::Up,
+                            NamedKey::ArrowDown => Direction::Down,
+                            _ => Direction::Right,
+                        };
+                        if self.modifiers.shift_key() {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::MoveWindowDirection { dir },
+                            ));
+                        } else {
+                            let _ = daemon.dispatch_action(ActionCommand::Wm(
+                                WmAction::FocusDirection { dir },
+                            ));
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusDirection {
+                            dir: Direction::Right,
+                        }));
+                        self.request_redraw();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
             match &key_event.logical_key {
                 Key::Named(NamedKey::Super) => {
                     let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::ToggleWidget {
@@ -539,30 +755,31 @@ impl NestedApp {
                     self.request_redraw();
                     return;
                 }
-                Key::Named(NamedKey::F1) => {
+                Key::Named(
+                    f_key @ (NamedKey::F1
+                    | NamedKey::F2
+                    | NamedKey::F3
+                    | NamedKey::F4
+                    | NamedKey::F5
+                    | NamedKey::F6
+                    | NamedKey::F7
+                    | NamedKey::F8
+                    | NamedKey::F9),
+                ) => {
+                    let idx = match f_key {
+                        NamedKey::F1 => 1,
+                        NamedKey::F2 => 2,
+                        NamedKey::F3 => 3,
+                        NamedKey::F4 => 4,
+                        NamedKey::F5 => 5,
+                        NamedKey::F6 => 6,
+                        NamedKey::F7 => 7,
+                        NamedKey::F8 => 8,
+                        NamedKey::F9 => 9,
+                        _ => 1,
+                    };
                     let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWorkspace {
-                        target: WorkspaceTarget::Index(1),
-                    }));
-                    self.request_redraw();
-                    return;
-                }
-                Key::Named(NamedKey::F2) => {
-                    let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWorkspace {
-                        target: WorkspaceTarget::Index(2),
-                    }));
-                    self.request_redraw();
-                    return;
-                }
-                Key::Named(NamedKey::F3) => {
-                    let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWorkspace {
-                        target: WorkspaceTarget::Index(3),
-                    }));
-                    self.request_redraw();
-                    return;
-                }
-                Key::Named(NamedKey::F4) => {
-                    let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWorkspace {
-                        target: WorkspaceTarget::Index(4),
+                        target: WorkspaceTarget::Index(idx),
                     }));
                     self.request_redraw();
                     return;
@@ -875,9 +1092,19 @@ impl ApplicationHandler for NestedApp {
             WindowEvent::MouseInput { state, button, .. } => match state {
                 ElementState::Pressed => {
                     self.handle_mouse_click(button);
+                    if self
+                        .daemon
+                        .as_ref()
+                        .is_some_and(|d| d.get_state_path(Some("sys.session.exit_requested")).as_bool())
+                    {
+                        event_loop.exit();
+                        return;
+                    }
                 }
                 ElementState::Released => {
-                    if button == MouseButton::Left && self.drag_state.take().is_some() {
+                    if matches!(button, MouseButton::Left | MouseButton::Right)
+                        && self.drag_state.take().is_some()
+                    {
                         if let Some(daemon) = self.daemon.as_mut() {
                             daemon.wm.end_interactive_grab();
                             let patches = daemon.wm.export_state_patches();
@@ -919,6 +1146,14 @@ impl ApplicationHandler for NestedApp {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_key_input(event);
+                if self
+                    .daemon
+                    .as_ref()
+                    .is_some_and(|d| d.get_state_path(Some("sys.session.exit_requested")).as_bool())
+                {
+                    event_loop.exit();
+                    return;
+                }
             }
             WindowEvent::RedrawRequested => {
                 self.needs_redraw = false;
@@ -1021,6 +1256,15 @@ impl ApplicationHandler for NestedApp {
                     dirty = true;
                 }
             }
+        }
+
+        if self
+            .daemon
+            .as_ref()
+            .is_some_and(|d| d.get_state_path(Some("sys.session.exit_requested")).as_bool())
+        {
+            event_loop.exit();
+            return;
         }
 
         if dirty {

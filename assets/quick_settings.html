@@ -1,4 +1,4 @@
-<meta name="shell-surface" data-name="quick_settings" data-layer="overlay" data-anchor="top,right" data-width="380" data-height="520" data-visible="false" />
+<meta name="shell-surface" data-name="quick_settings" data-layer="overlay" data-anchor="top,right" data-width="380" data-height="560" data-visible="false" />
 <div id="quick-settings" class="modal-surface qs-panel">
   <div id="qs-header" class="qs-header">
     <div class="qs-title-group">
@@ -55,6 +55,23 @@
     </div>
 
     <div class="slider-row">
+      <span class="slider-label">Brightness {{ sys.brightness.percent | default(80) }}%</span>
+      <div class="slider-actions">
+        <button class="mini-btn" on-click="sys:change-brightness(-10)">-</button>
+        <button class="mini-btn" on-click="sys:change-brightness(10)">+</button>
+      </div>
+    </div>
+
+    <div class="slider-row">
+      <span class="slider-label">Display {{ sys.display.resolution | default('1920x1080') }}</span>
+      <div class="slider-actions">
+        <button class="mini-btn" on-click="sys:set-resolution(1920x1080)">1080p</button>
+        <button class="mini-btn" on-click="sys:set-resolution(1600x900)">900p</button>
+        <button class="mini-btn" on-click="sys:set-resolution(1280x800)">800p</button>
+      </div>
+    </div>
+
+    <div class="slider-row">
       <span class="slider-label">Theme</span>
       <div class="slider-actions">
         <button class="mini-btn" on-click="shell:set-theme('catppuccin')">Catppuccin</button>
@@ -84,5 +101,11 @@
         <span class="notif-body">{{ item.body | truncate(52) }}</span>
       </div>
     </div>
+  </div>
+
+  <div id="qs-power-bar" class="qs-power-bar">
+    <button class="mini-btn power-btn" on-click="sys:logout()">Log Out</button>
+    <button class="mini-btn power-btn" on-click="sys:reboot()">Reboot</button>
+    <button class="mini-btn power-btn danger-btn" on-click="sys:poweroff()">Power Off</button>
   </div>
 </div>

@@ -224,21 +224,87 @@ impl LuminaWmCore {
         self.export_state_patches()
     }
 
-    /// Fast O(1) update of interactive window position without building state patches on every mouse motion event.
+    /// Fast O(1) update of interactive window position or 8-edge resize without building state patches on every mouse motion event.
     pub fn move_interactive_grab_fast(&mut self, dx: f32, dy: f32) -> bool {
-        let Some(InteractiveGrab::Move { win_id, start_rect }) = self.interactive_grab else {
+        let Some(grab) = self.interactive_grab else {
             return false;
         };
-        if let Some(win) = self.windows.iter_mut().find(|w| w.id == win_id) {
-            win.is_floating = true;
-            win.rect = Rect::new(
-                start_rect.x + dx,
-                start_rect.y + dy,
-                start_rect.width,
-                start_rect.height,
-            );
-            self.saved_floating_rects.insert(win_id, win.rect);
-            return true;
+        match grab {
+            InteractiveGrab::Move { win_id, start_rect } => {
+                if let Some(win) = self.windows.iter_mut().find(|w| w.id == win_id) {
+                    win.is_floating = true;
+                    win.is_maximized = false;
+                    win.rect = Rect::new(
+                        start_rect.x + dx,
+                        start_rect.y + dy,
+                        start_rect.width,
+                        start_rect.height,
+                    );
+                    self.saved_floating_rects.insert(win_id, win.rect);
+                    self.sync_workspace_and_window_geometries();
+                    return true;
+                }
+            }
+            InteractiveGrab::Resize {
+                win_id,
+                edge,
+                start_rect,
+            } => {
+                if let Some(win) = self.windows.iter_mut().find(|w| w.id == win_id) {
+                    win.is_floating = true;
+                    win.is_maximized = false;
+                    let mut x = start_rect.x;
+                    let mut y = start_rect.y;
+                    let mut w = start_rect.width;
+                    let mut h = start_rect.height;
+                    let min_w = 160.0;
+                    let min_h = 100.0;
+
+                    match edge {
+                        ResizeEdge::Right => w = (w + dx).max(min_w),
+                        ResizeEdge::Bottom => h = (h + dy).max(min_h),
+                        ResizeEdge::Left => {
+                            let new_w = (w - dx).max(min_w);
+                            x += w - new_w;
+                            w = new_w;
+                        }
+                        ResizeEdge::Top => {
+                            let new_h = (h - dy).max(min_h);
+                            y += h - new_h;
+                            h = new_h;
+                        }
+                        ResizeEdge::TopLeft => {
+                            let new_w = (w - dx).max(min_w);
+                            let new_h = (h - dy).max(min_h);
+                            x += w - new_w;
+                            y += h - new_h;
+                            w = new_w;
+                            h = new_h;
+                        }
+                        ResizeEdge::TopRight => {
+                            let new_h = (h - dy).max(min_h);
+                            y += h - new_h;
+                            w = (w + dx).max(min_w);
+                            h = new_h;
+                        }
+                        ResizeEdge::BottomLeft => {
+                            let new_w = (w - dx).max(min_w);
+                            x += w - new_w;
+                            w = new_w;
+                            h = (h + dy).max(min_h);
+                        }
+                        ResizeEdge::BottomRight => {
+                            w = (w + dx).max(min_w);
+                            h = (h + dy).max(min_h);
+                        }
+                    }
+
+                    win.rect = Rect::new(x, y, w, h);
+                    self.saved_floating_rects.insert(win_id, win.rect);
+                    self.sync_workspace_and_window_geometries();
+                    return true;
+                }
+            }
         }
         false
     }
@@ -763,12 +829,21 @@ impl WindowManagerEngine for LuminaWmCore {
                 self.overview_open = !self.overview_open;
             }
             WmAction::BeginInteractiveMove { win_id } => {
-                let start_rect = self
-                    .windows
-                    .iter()
-                    .find(|w| w.id == *win_id)
-                    .map(|w| w.rect)
-                    .ok_or_else(|| format!("Window {win_id} not found"))?;
+                let start_rect = {
+                    let win = self
+                        .windows
+                        .iter_mut()
+                        .find(|w| w.id == *win_id)
+                        .ok_or_else(|| format!("Window {win_id} not found"))?;
+                    win.is_maximized = false;
+                    if !win.is_floating {
+                        win.is_floating = true;
+                    }
+                    let rect = win.rect;
+                    self.saved_floating_rects.insert(*win_id, rect);
+                    rect
+                };
+                self.raise_floating_window(*win_id);
                 self.set_focused_window_internal(Some(*win_id));
                 self.interactive_grab = Some(InteractiveGrab::Move {
                     win_id: *win_id,
@@ -776,12 +851,21 @@ impl WindowManagerEngine for LuminaWmCore {
                 });
             }
             WmAction::BeginInteractiveResize { win_id, edge } => {
-                let start_rect = self
-                    .windows
-                    .iter()
-                    .find(|w| w.id == *win_id)
-                    .map(|w| w.rect)
-                    .ok_or_else(|| format!("Window {win_id} not found"))?;
+                let start_rect = {
+                    let win = self
+                        .windows
+                        .iter_mut()
+                        .find(|w| w.id == *win_id)
+                        .ok_or_else(|| format!("Window {win_id} not found"))?;
+                    win.is_maximized = false;
+                    if !win.is_floating {
+                        win.is_floating = true;
+                    }
+                    let rect = win.rect;
+                    self.saved_floating_rects.insert(*win_id, rect);
+                    rect
+                };
+                self.raise_floating_window(*win_id);
                 self.set_focused_window_internal(Some(*win_id));
                 self.interactive_grab = Some(InteractiveGrab::Resize {
                     win_id: *win_id,

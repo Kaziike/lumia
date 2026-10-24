@@ -23,6 +23,17 @@ const DEFAULT_DOCK_HTML: &str = include_str!("../../../assets/dock.html");
 const DEFAULT_LAUNCHER_HTML: &str = include_str!("../../../assets/launcher.html");
 const DEFAULT_QUICK_SETTINGS_HTML: &str = include_str!("../../../assets/quick_settings.html");
 const DEFAULT_WINDOW_DEC_HTML: &str = include_str!("../../../assets/window_decoration.html");
+const DEFAULT_NOTIFICATIONS_HTML: &str = r#"<meta name="shell-surface" data-name="notifications" data-layer="top" data-width="360" data-height="96" data-visible="true" />
+<div id="toast-container" class="toast-surface" data-for="item in notif.toasts" data-key="item.id">
+  <div class="notif-card toast-card" :class.urgent="item.urgency == 'critical'">
+    <div class="notif-card-top">
+      <span class="notif-app">{{ item.app_name | default('System') }}</span>
+      <button class="notif-dismiss-btn" on-click="notif:dismiss({{ item.id }})">✕</button>
+    </div>
+    <span class="notif-summary">{{ item.summary }}</span>
+    <span class="notif-body">{{ item.body | truncate(48) }}</span>
+  </div>
+</div>"#;
 const DEFAULT_CATPPUCCIN_CSS: &str = include_str!("../../../assets/css/theme-catppuccin.css");
 const DEFAULT_CYBERPUNK_CSS: &str = include_str!("../../../assets/css/theme-cyberpunk.css");
 
@@ -138,13 +149,12 @@ impl LuminaDaemon {
             "sys.display.resolution",
             StateValue::String("1920x1080".to_string()),
         );
-        sys_providers.notif.push_notification(
+        let notif_patches = sys_providers.notif.push_notification(
             "Lumina WM",
             "Pure-Rust HTML/CSS Compositor Ready",
             "Rendered with Taffy + Tiny-Skia + Smithay (0% WebKit/Electron).",
             "normal",
         );
-        let notif_patches = sys_providers.notif.poll_updates();
         store.apply_patches(notif_patches);
 
         let mut css_variables = BTreeMap::new();
@@ -250,7 +260,7 @@ impl LuminaDaemon {
         for name in ["quick_settings", "control-center"] {
             if let Some(widget) = self.widgets.get_mut(name) {
                 widget.width = 380;
-                widget.height = 520;
+                widget.height = 560;
             }
         }
         if let Some(widget) = self.widgets.get_mut("launcher") {
@@ -333,16 +343,23 @@ impl LuminaDaemon {
             (
                 "quick_settings",
                 DEFAULT_QUICK_SETTINGS_HTML,
-                Size::new(380.0, 520.0),
+                Size::new(380.0, 560.0),
                 false,
                 "overlay",
             ),
             (
                 "control-center",
                 DEFAULT_QUICK_SETTINGS_HTML,
-                Size::new(380.0, 520.0),
+                Size::new(380.0, 560.0),
                 false,
                 "overlay",
+            ),
+            (
+                "notifications",
+                DEFAULT_NOTIFICATIONS_HTML,
+                Size::new(360.0, 96.0),
+                true,
+                "top",
             ),
             (
                 "window_decoration",
@@ -775,6 +792,21 @@ impl LuminaDaemon {
             }
         }
 
+        // 7. Render Toast Notifications when overlays are closed and a toast is present
+        if !qs_visible && !launcher_visible {
+            let has_toast = self
+                .store
+                .get("notif.toasts.len")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                > 0;
+            if has_toast {
+                if let Some(toast_fb) = self.render_surface("notifications") {
+                    blit_framebuffer(&mut desktop, &toast_fb, (width as i32) - 376, 54);
+                }
+            }
+        }
+
         desktop
     }
 
@@ -790,6 +822,20 @@ impl LuminaDaemon {
         if let Some(muted) = self.store.get("sys.audio.muted") {
             self.store.set("audio.muted", muted);
         }
+        let dnd = self
+            .store
+            .get("notif.dnd")
+            .map(|v| v.as_bool())
+            .unwrap_or(false);
+        let toasts = if dnd {
+            Vec::new()
+        } else {
+            match self.store.get("notif.list") {
+                Some(StateValue::List(list)) => list.last().cloned().into_iter().collect(),
+                _ => Vec::new(),
+            }
+        };
+        self.store.set("notif.toasts", StateValue::List(toasts));
         self.recompute_all_surfaces();
     }
 
@@ -915,6 +961,35 @@ impl LuminaDaemon {
                 );
                 self.resize_output(width, height, 1.0);
                 Ok(format!("Set display resolution to {width}x{height}"))
+            }
+            ActionCommand::Sys(SysAction::Logout) => {
+                self.store
+                    .set("sys.session.exit_requested", StateValue::Bool(true));
+                Ok("Session logout requested".to_string())
+            }
+            ActionCommand::Sys(SysAction::Reboot) => {
+                self.store.set(
+                    "sys.session.power_action",
+                    StateValue::String("reboot".to_string()),
+                );
+                if std::env::var("LUMINA_IN_CAGE").is_ok() {
+                    let _ = std::process::Command::new("systemctl")
+                        .arg("reboot")
+                        .spawn();
+                }
+                Ok("System reboot requested".to_string())
+            }
+            ActionCommand::Sys(SysAction::PowerOff) => {
+                self.store.set(
+                    "sys.session.power_action",
+                    StateValue::String("poweroff".to_string()),
+                );
+                if std::env::var("LUMINA_IN_CAGE").is_ok() {
+                    let _ = std::process::Command::new("systemctl")
+                        .arg("poweroff")
+                        .spawn();
+                }
+                Ok("System poweroff requested".to_string())
             }
             ActionCommand::Sys(_) | ActionCommand::Notif(_) => {
                 let patches = self.sys_providers.handle_action(&action)?;

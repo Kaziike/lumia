@@ -9,9 +9,9 @@ pub use icons::{detect_icon_name, draw_vector_icon};
 pub use primitives::{build_rounded_rect_path, draw_background, draw_border, draw_box_shadow};
 pub use snapshot::{encode_bmp, encode_ppm, save_bmp, save_ppm};
 pub use window_decoration::{
-    hit_test_titlebar, render_window_decoration, render_window_decoration_with_theme,
-    render_window_with_app_content, render_window_with_client_buffer, TitlebarHit,
-    WindowDecorationTheme,
+    hit_test_resize_edge, hit_test_titlebar, render_window_decoration,
+    render_window_decoration_with_theme, render_window_with_app_content,
+    render_window_with_client_buffer, TitlebarHit, WindowDecorationTheme,
 };
 pub use wm_proto;
 
@@ -790,5 +790,60 @@ mod tests {
         let idx = ((2 * 64 + 2) * 4) as usize;
         assert_eq!(fb.pixels[idx], 255);
         assert_eq!(fb.pixels[idx + 2], 0);
+    }
+
+    #[test]
+    fn test_hit_test_resize_edge_8_directions() {
+        use wm_proto::{Point, ResizeEdge};
+        let placement = WindowPlacement {
+            window_id: 1,
+            frame_rect: Rect::new(100.0, 100.0, 400.0, 300.0),
+            content_rect: Rect::new(102.0, 132.0, 396.0, 266.0),
+            titlebar_rect: Some(Rect::new(100.0, 100.0, 400.0, 32.0)),
+            border_width: 2.0,
+            border_radius: 10.0,
+            is_focused: true,
+            is_floating: true,
+            is_fullscreen: false,
+            z_order: 1,
+        };
+
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(102.0, 102.0)),
+            Some(ResizeEdge::TopLeft)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(498.0, 102.0)),
+            Some(ResizeEdge::TopRight)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(102.0, 398.0)),
+            Some(ResizeEdge::BottomLeft)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(498.0, 398.0)),
+            Some(ResizeEdge::BottomRight)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(102.0, 250.0)),
+            Some(ResizeEdge::Left)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(498.0, 250.0)),
+            Some(ResizeEdge::Right)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(300.0, 102.0)),
+            Some(ResizeEdge::Top)
+        );
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(300.0, 398.0)),
+            Some(ResizeEdge::Bottom)
+        );
+        // Center interior should be None
+        assert_eq!(
+            hit_test_resize_edge(&placement, Point::new(300.0, 250.0)),
+            None
+        );
     }
 }

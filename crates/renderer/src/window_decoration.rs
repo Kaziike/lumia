@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use tiny_skia::Pixmap;
 use wm_proto::{
     BoxShadow, Color, ComputedStyle, DomNodeData, DomNodeKind, Edges, FrameBuffer, GradientStop,
-    LinearGradient, NodeId, Point, PseudoStates, Rect, TextAlign, WindowPlacement,
+    LinearGradient, NodeId, Point, PseudoStates, Rect, ResizeEdge, TextAlign, WindowPlacement,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +16,55 @@ pub enum TitlebarHit {
     Maximize,
     Close,
     DragArea,
+}
+
+/// Hit-tests a global screen point against a window's 8 resize edges and corners.
+pub fn hit_test_resize_edge(placement: &WindowPlacement, pt: Point) -> Option<ResizeEdge> {
+    if placement.is_fullscreen {
+        return None;
+    }
+    let r = placement.frame_rect;
+    let outer = r.inset(Edges::all(-4.0));
+    let inner = r.inset(Edges::all(6.0));
+    if !outer.contains(pt) || inner.contains(pt) {
+        return None;
+    }
+
+    let corner_zone = 16.0;
+    let edge_zone = 6.0;
+
+    let near_left_corner = pt.x <= r.x + corner_zone;
+    let near_right_corner = pt.x >= r.right() - corner_zone;
+    let near_top_corner = pt.y <= r.y + corner_zone;
+    let near_bottom_corner = pt.y >= r.bottom() - corner_zone;
+
+    if near_left_corner && near_top_corner {
+        return Some(ResizeEdge::TopLeft);
+    }
+    if near_right_corner && near_top_corner {
+        return Some(ResizeEdge::TopRight);
+    }
+    if near_left_corner && near_bottom_corner {
+        return Some(ResizeEdge::BottomLeft);
+    }
+    if near_right_corner && near_bottom_corner {
+        return Some(ResizeEdge::BottomRight);
+    }
+
+    if pt.x <= r.x + edge_zone {
+        return Some(ResizeEdge::Left);
+    }
+    if pt.x >= r.right() - edge_zone {
+        return Some(ResizeEdge::Right);
+    }
+    if pt.y <= r.y + edge_zone {
+        return Some(ResizeEdge::Top);
+    }
+    if pt.y >= r.bottom() - edge_zone {
+        return Some(ResizeEdge::Bottom);
+    }
+
+    None
 }
 
 /// Hit-tests a global screen point against a window's server-side titlebar and control buttons.

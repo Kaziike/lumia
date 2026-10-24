@@ -127,7 +127,11 @@ pub enum SysAction {
     ChangeVolume { delta: i8 },
     ToggleMute,
     SetBrightness { percent: u8 },
+    ChangeBrightness { delta: i8 },
     SetResolution { width: u32, height: u32 },
+    Logout,
+    Reboot,
+    PowerOff,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -420,6 +424,17 @@ impl ActionCommand {
                     .clamp(0.0, 100.0) as u8;
                 SysAction::SetBrightness { percent }
             }
+            "change-brightness" => {
+                let delta = args
+                    .first()
+                    .ok_or("change-brightness requires delta")?
+                    .parse::<i8>()
+                    .map_err(|e| e.to_string())?;
+                SysAction::ChangeBrightness { delta }
+            }
+            "logout" | "exit-session" => SysAction::Logout,
+            "reboot" => SysAction::Reboot,
+            "poweroff" | "shutdown" => SysAction::PowerOff,
             "set-resolution" => {
                 let (width, height) = if args.len() >= 2 {
                     let w = args[0]
@@ -570,5 +585,30 @@ fn unquote(s: &str) -> String {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sys_brightness_and_power_dsl() {
+        assert_eq!(
+            ActionCommand::parse_dsl("sys:change-brightness(-10)").unwrap(),
+            ActionCommand::Sys(SysAction::ChangeBrightness { delta: -10 })
+        );
+        assert_eq!(
+            ActionCommand::parse_dsl("sys:logout()").unwrap(),
+            ActionCommand::Sys(SysAction::Logout)
+        );
+        assert_eq!(
+            ActionCommand::parse_dsl("sys:reboot()").unwrap(),
+            ActionCommand::Sys(SysAction::Reboot)
+        );
+        assert_eq!(
+            ActionCommand::parse_dsl("sys:poweroff()").unwrap(),
+            ActionCommand::Sys(SysAction::PowerOff)
+        );
     }
 }

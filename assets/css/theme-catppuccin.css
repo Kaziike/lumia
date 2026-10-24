@@ -311,6 +311,12 @@
   font-weight: 600;
 }
 
+.mini-btn:hover,
+.icon-btn:hover {
+  background-color: var(--bg-pill-hover);
+  border-color: var(--accent);
+}
+
 .app-icon,
 .qs-tile-icon {
   width: 18px;
@@ -430,9 +436,43 @@
   color: var(--text-main);
 }
 
+.qs-tile:hover {
+  background-color: var(--bg-pill-hover);
+  border-color: var(--accent);
+}
+
 .qs-tile.active {
   background: linear-gradient(135deg, rgba(137, 180, 250, 0.3) 0%, rgba(203, 166, 247, 0.25) 100%);
   border-color: var(--accent);
+}
+
+.qs-power-bar {
+  display: flex;
+  flex-direction: row;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 0px 0px 0px;
+  border-width: 1px 0px 0px 0px;
+  border-color: var(--border-inactive);
+}
+
+.power-btn {
+  flex-grow: 1;
+  height: 30px;
+}
+
+.danger-btn {
+  background-color: rgba(243, 139, 168, 0.2);
+  border-color: var(--urgent);
+  color: var(--urgent);
+}
+
+.danger-btn:hover {
+  background-color: var(--urgent);
+  border-color: var(--urgent);
+  color: var(--text-dark);
 }
 
 .notif-card {
@@ -450,6 +490,52 @@
 .notif-card.urgent {
   border-color: var(--urgent);
   background-color: rgba(243, 139, 168, 0.16);
+}
+
+.notif-app {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.notif-summary {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-main);
+}
+
+.notif-body {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.notif-dismiss-btn {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background-color: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: center;
+}
+
+.notif-dismiss-btn:hover {
+  background-color: rgba(243, 139, 168, 0.25);
+  color: var(--urgent);
+}
+
+.toast-surface {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  padding: 4px;
+}
+
+.toast-card {
+  background-color: var(--bg-elevated);
+  border-width: 2px;
+  border-color: var(--accent);
+  box-shadow: 0px 8px 24px rgba(0, 0, 0, 0.6);
 }
 
 /* Server-Side Window Decoration */
