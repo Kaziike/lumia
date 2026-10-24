@@ -1,3 +1,4 @@
+use crate::shell_layout::ShellLayout;
 use crate::wayland_compositor::{RealWaylandServer, WaylandCompositorEvent};
 use css_style::CssStyleEngine;
 use html_dom::{DomDocument, DomEventKind};
@@ -13,9 +14,9 @@ use wm_core::{LuminaWmCore, WaylandCompositorHost};
 use wm_proto::{
     ActionCommand, ComputedStyle, DomElementInfo, DomTreeView, FrameBuffer, IpcCommand,
     IpcPayload, IpcRequest, IpcResponse, LayoutBox, LayoutSolver, NodeId, OutputDescriptor, Point,
-    Rect, ReloadTarget, ShellAction, Size, StatePatch, StateProvider, StateValue, StyleEngine,
-    SurfaceMetadata, SurfaceRenderer, SysAction, WidgetStatus, WindowDescriptor,
-    WindowManagerEngine, WmAction,
+    Rect, ReloadTarget, ShellAction, Size, StatePatch, StateValue, StyleEngine, SurfaceMetadata,
+    SurfaceRenderer, SysAction, WidgetStatus, WindowDescriptor, WindowManagerEngine,
+    WindowPlacement, WmAction,
 };
 
 const DEFAULT_TOPBAR_HTML: &str = include_str!("../../../assets/topbar.html");
@@ -61,8 +62,12 @@ pub struct LiveSurface {
     pub visible: bool,
     pub layer: String,
     pub dirty: bool,
+    pub frame_serial: u64,
     pub last_frame: Option<FrameBuffer>,
 }
+
+/// Pure-Rust HTML/CSS Desktop Shell & Window Manager state host (`LuminaShell` alias).
+pub type LuminaShell = LuminaDaemon;
 
 /// Orchestrates `LuminaWmCore`, `WaylandCompositorHost`, `StateStore`, `SystemProviderManager`,
 /// `DomDocument` surfaces, `CssStyleEngine`, `TaffyLayoutEngine`, and `SkiaRenderer`.
@@ -70,6 +75,9 @@ pub struct LuminaDaemon {
     pub wm: LuminaWmCore,
     pub compositor: WaylandCompositorHost,
     pub wayland_server: Option<RealWaylandServer>,
+    pub external_compositor_active: bool,
+    pub pending_spawn_commands: Vec<String>,
+    pub pending_close_windows: Vec<u64>,
     pub store: StateStore,
     pub sys_providers: SystemProviderManager,
     pub style_engine: CssStyleEngine,
@@ -87,8 +95,10 @@ pub struct LuminaDaemon {
     pub terminal_rev: u64,
     pub output_width: u32,
     pub output_height: u32,
+    pub wallpaper_serial: u64,
     cached_wallpaper: Option<(String, FrameBuffer)>,
-    window_frame_cache: HashMap<u64, (WindowCacheKey, FrameBuffer)>,
+    window_frame_cache: HashMap<u64, (WindowCacheKey, FrameBuffer, u64)>,
+    next_window_frame_serial: u64,
 }
 
 impl Default for LuminaDaemon {
@@ -169,6 +179,9 @@ impl LuminaDaemon {
             wm,
             compositor,
             wayland_server: None,
+            external_compositor_active: false,
+            pending_spawn_commands: Vec::new(),
+            pending_close_windows: Vec::new(),
             store,
             sys_providers,
             style_engine,
@@ -186,8 +199,10 @@ impl LuminaDaemon {
             terminal_rev: 1,
             output_width: 1920,
             output_height: 1080,
+            wallpaper_serial: 1,
             cached_wallpaper: None,
             window_frame_cache: HashMap::new(),
+            next_window_frame_serial: 1,
         };
 
         // Sync initial WM state into store
@@ -205,6 +220,71 @@ impl LuminaDaemon {
     pub fn clear_startup_windows(&mut self) {
         self.window_frame_cache.clear();
         let patches = self.wm.clear_all_windows();
+        self.apply_state_patches(patches);
+    }
+
+    /// Marks that an external compositor (such as Smithay) is driving this `LuminaShell` instance.
+    pub fn set_external_compositor_active(&mut self, active: bool) {
+        self.external_compositor_active = active;
+    }
+
+    /// Drains queued client application launch commands requested while `external_compositor_active` is enabled.
+    pub fn drain_pending_spawn_commands(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_spawn_commands)
+    }
+
+    /// Drains queued client window close requests triggered by WM/Shell actions.
+    pub fn drain_pending_close_windows(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.pending_close_windows)
+    }
+
+    /// Returns the declarative `ShellLayout` for the current primary output.
+    pub fn shell_layout(&self) -> ShellLayout {
+        let w = self.output_width.max(640) as f32;
+        let h = self.output_height.max(480) as f32;
+        let has_toast = self
+            .store
+            .get("notif.toasts.len")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0;
+        ShellLayout::compute_for_output(
+            Rect::new(0.0, 0.0, w, h),
+            &self.surfaces,
+            &self.widgets,
+            has_toast,
+        )
+    }
+
+    /// Notifies the shell that a Wayland client window was mapped.
+    pub fn on_client_window_opened(&mut self, window_id: u64, title: String, app_id: String) {
+        let patches = self.wm.on_window_opened(WindowDescriptor {
+            id: window_id,
+            title,
+            app_id: app_id.clone(),
+            icon: app_id,
+            workspace_id: self.wm.active_workspace_id(),
+            is_focused: true,
+            is_floating: false,
+            is_fullscreen: false,
+            is_maximized: false,
+            is_minimized: false,
+            is_urgent: false,
+            rect: Rect::default(),
+        });
+        self.apply_state_patches(patches);
+    }
+
+    /// Notifies the shell that a Wayland client window updated its title or `app_id`.
+    pub fn on_client_window_updated(&mut self, window_id: u64, title: String, app_id: String) {
+        let patches = self.wm.update_window_metadata(window_id, title, app_id);
+        self.apply_state_patches(patches);
+    }
+
+    /// Notifies the shell that a Wayland client window was unmapped/closed.
+    pub fn on_client_window_closed(&mut self, window_id: u64) {
+        self.window_frame_cache.remove(&window_id);
+        let patches = self.wm.on_window_closed(window_id);
         self.apply_state_patches(patches);
     }
 
@@ -228,45 +308,45 @@ impl LuminaDaemon {
         }
         self.output_width = w;
         self.output_height = h;
+        self.wallpaper_serial = self.wallpaper_serial.wrapping_add(1);
         self.cached_wallpaper = None;
         self.window_frame_cache.clear();
 
-        self.wm.add_output(OutputDescriptor {
-            name: "eDP-1".to_string(),
-            make: "Lumina".to_string(),
-            model: "Virtual Wayland Display".to_string(),
-            rect: Rect::new(0.0, 0.0, w as f32, h as f32),
-            usable_rect: Rect::new(0.0, 44.0, w as f32, (h as f32 - 44.0).max(100.0)),
-            scale: scale.max(1.0),
-            refresh_hz: 60,
-        });
+        let topbar_h = self
+            .surfaces
+            .get("topbar")
+            .and_then(|s| s.dom.metadata().height)
+            .unwrap_or(44);
 
         for name in ["panel", "topbar"] {
             if let Some(surf) = self.surfaces.get_mut(name) {
-                surf.viewport = Size::new(w as f32, 44.0);
+                surf.viewport = Size::new(w as f32, topbar_h as f32);
                 surf.dirty = true;
                 surf.last_frame = None;
             }
             if let Some(widget) = self.widgets.get_mut(name) {
                 widget.width = w;
-                widget.height = 44;
+                widget.height = topbar_h;
             }
         }
 
-        if let Some(widget) = self.widgets.get_mut("dock") {
-            widget.width = 680;
-            widget.height = 58;
-        }
-        for name in ["quick_settings", "control-center"] {
-            if let Some(widget) = self.widgets.get_mut(name) {
-                widget.width = 380;
-                widget.height = 560;
-            }
-        }
-        if let Some(widget) = self.widgets.get_mut("launcher") {
-            widget.width = 640;
-            widget.height = 440;
-        }
+        let layout = self.shell_layout();
+        let output_name = self
+            .wm
+            .outputs()
+            .first()
+            .map(|o| o.name.clone())
+            .unwrap_or_else(|| "eDP-1".to_string());
+
+        self.wm.add_output(OutputDescriptor {
+            name: output_name,
+            make: "Lumina".to_string(),
+            model: "Virtual Wayland Display".to_string(),
+            rect: layout.output_rect(),
+            usable_rect: layout.usable_rect(),
+            scale: scale.max(1.0),
+            refresh_hz: 60,
+        });
 
         if let Some(ref mut wl) = self.wayland_server {
             wl.set_output_mode(w, h, scale);
@@ -291,7 +371,6 @@ impl LuminaDaemon {
         if events.is_empty() {
             return false;
         }
-        let mut patches = Vec::new();
         for ev in events {
             match ev {
                 WaylandCompositorEvent::WindowOpened {
@@ -299,37 +378,20 @@ impl LuminaDaemon {
                     title,
                     app_id,
                 } => {
-                    patches.extend(self.wm.on_window_opened(WindowDescriptor {
-                        id: window_id,
-                        title,
-                        app_id: app_id.clone(),
-                        icon: app_id,
-                        workspace_id: self.wm.active_workspace_id(),
-                        is_focused: true,
-                        is_floating: false,
-                        is_fullscreen: false,
-                        is_maximized: false,
-                        is_minimized: false,
-                        is_urgent: false,
-                        rect: Rect::default(),
-                    }));
+                    self.on_client_window_opened(window_id, title, app_id);
                 }
                 WaylandCompositorEvent::WindowUpdated {
                     window_id,
                     title,
                     app_id,
                 } => {
-                    patches.extend(self.wm.update_window_metadata(window_id, title, app_id));
+                    self.on_client_window_updated(window_id, title, app_id);
                 }
                 WaylandCompositorEvent::WindowClosed { window_id } => {
-                    self.window_frame_cache.remove(&window_id);
-                    patches.extend(self.wm.on_window_closed(window_id));
+                    self.on_client_window_closed(window_id);
                 }
                 WaylandCompositorEvent::WindowFrameCommitted { .. } => {}
             }
-        }
-        if !patches.is_empty() {
-            self.apply_state_patches(patches);
         }
         true
     }
@@ -386,6 +448,7 @@ impl LuminaDaemon {
                     visible,
                     layer: layer.to_string(),
                     dirty: true,
+                    frame_serial: 1,
                     last_frame: None,
                 },
             );
@@ -438,10 +501,16 @@ impl LuminaDaemon {
     /// Renders a specific HTML/CSS surface into an RGBA8 `FrameBuffer`, utilizing surface frame caching
     /// when `surf.dirty == false` for sub-millisecond compositing.
     pub fn render_surface(&mut self, name: &str) -> Option<FrameBuffer> {
+        self.render_surface_with_serial(name).map(|(fb, _)| fb)
+    }
+
+    /// Renders a named HTML/CSS surface and returns `(FrameBuffer, frame_serial)`.
+    /// `frame_serial` only increments when the surface was dirty and re-rendered.
+    pub fn render_surface_with_serial(&mut self, name: &str) -> Option<(FrameBuffer, u64)> {
         let surf = self.surfaces.get_mut(name)?;
         if !surf.dirty {
             if let Some(ref cached) = surf.last_frame {
-                return Some(cached.clone());
+                return Some((cached.clone(), surf.frame_serial));
             }
         }
         surf.dom.sync_reactive_state(&self.store);
@@ -452,9 +521,80 @@ impl LuminaDaemon {
         let fb = self
             .renderer
             .render_surface(&surf.dom, &surf.styles, &surf.layouts, surf.viewport);
+        surf.frame_serial = surf.frame_serial.wrapping_add(1).max(1);
         surf.last_frame = Some(fb.clone());
         surf.dirty = false;
-        Some(fb)
+        Some((fb, surf.frame_serial))
+    }
+
+    /// Returns the cached desktop wallpaper `FrameBuffer` and its `wallpaper_serial`.
+    pub fn wallpaper_with_serial(&mut self) -> (FrameBuffer, u64) {
+        let width = self.output_width.max(640);
+        let height = self.output_height.max(480);
+        let fb = self.get_or_build_wallpaper(width, height);
+        (fb, self.wallpaper_serial)
+    }
+
+    /// Renders a window's Server-Side Decoration frame (and optional built-in terminal content)
+    /// with per-window caching and serial tracking for GPU `MemoryRenderBuffer` uploads.
+    pub fn render_window_decoration_frame(
+        &mut self,
+        placement: &WindowPlacement,
+        app_id: &str,
+        title: &str,
+        is_urgent: bool,
+    ) -> (FrameBuffer, u64) {
+        let is_builtin_term = app_id == "org.lumina.terminal";
+        let cache_key = WindowCacheKey {
+            width: placement.frame_rect.width.round().max(1.0) as u32,
+            height: placement.frame_rect.height.round().max(1.0) as u32,
+            is_focused: placement.is_focused,
+            is_floating: placement.is_floating,
+            is_fullscreen: placement.is_fullscreen,
+            is_urgent,
+            title: title.to_string(),
+            client_serial: 0,
+            terminal_rev: if is_builtin_term {
+                self.terminal_rev
+            } else {
+                0
+            },
+        };
+
+        if let Some((ref k, ref fb, serial)) = self.window_frame_cache.get(&placement.window_id) {
+            if k == &cache_key {
+                return (fb.clone(), *serial);
+            }
+        }
+
+        let win_fb = if is_builtin_term {
+            renderer::render_window_with_client_buffer(
+                self.renderer.font_manager(),
+                placement,
+                app_id,
+                title,
+                is_urgent,
+                None,
+                &self.terminal_lines,
+                &self.terminal_input,
+                None,
+            )
+        } else {
+            renderer::render_window_decoration(
+                self.renderer.font_manager(),
+                placement,
+                title,
+                is_urgent,
+                None,
+            )
+        };
+        let serial = self.next_window_frame_serial;
+        self.next_window_frame_serial = self.next_window_frame_serial.wrapping_add(1).max(1);
+        self.window_frame_cache.insert(
+            placement.window_id,
+            (cache_key, win_fb.clone(), serial),
+        );
+        (win_fb, serial)
     }
 
     /// Updates `:hover` state on a named HTML surface and returns `true` if the hovered element changed.
@@ -639,17 +779,8 @@ impl LuminaDaemon {
         let mut desktop = self.get_or_build_wallpaper(width, height);
 
         // 2. Render tiled/floating windows on active workspace with Server-Side Decorations + App Client UI
-        let usable = self
-            .wm
-            .outputs()
-            .first()
-            .map(|o| o.usable_rect)
-            .unwrap_or(Rect::new(
-                0.0,
-                44.0,
-                width as f32,
-                (height as f32 - 44.0).max(100.0),
-            ));
+        let layout = self.shell_layout();
+        let usable = layout.usable_rect();
         let placements = self.wm.compute_window_placements(usable);
         let windows_map: HashMap<u64, WindowDescriptor> = self
             .wm
@@ -705,7 +836,7 @@ impl LuminaDaemon {
             let cache_hit = self
                 .window_frame_cache
                 .get(&placement.window_id)
-                .map(|(k, _)| k == &cache_key)
+                .map(|(k, _, _)| k == &cache_key)
                 .unwrap_or(false);
 
             if !cache_hit {
@@ -726,11 +857,14 @@ impl LuminaDaemon {
                     &self.terminal_input,
                     None,
                 );
+                let serial = self.next_window_frame_serial;
+                self.next_window_frame_serial =
+                    self.next_window_frame_serial.wrapping_add(1).max(1);
                 self.window_frame_cache
-                    .insert(placement.window_id, (cache_key, win_fb));
+                    .insert(placement.window_id, (cache_key, win_fb, serial));
             }
 
-            if let Some((_, ref win_fb)) = self.window_frame_cache.get(&placement.window_id) {
+            if let Some((_, ref win_fb, _)) = self.window_frame_cache.get(&placement.window_id) {
                 blit_framebuffer(
                     &mut desktop,
                     win_fb,
@@ -740,69 +874,16 @@ impl LuminaDaemon {
             }
         }
 
-        // 3. Render Topbar (`topbar` at (0, 0))
-        if let Some(topbar_fb) = self.render_surface("topbar") {
-            blit_framebuffer(&mut desktop, &topbar_fb, 0, 0);
-        }
-
-        // 4. Render Bottom Dock (`dock` centered at bottom)
-        let dock_visible = self
-            .surfaces
-            .get("dock")
-            .map(|s| s.visible)
-            .unwrap_or(true);
-        if dock_visible {
-            if let Some(dock_fb) = self.render_surface("dock") {
-                let dx = ((width as i32) - (dock_fb.width as i32)) / 2;
-                let dy = (height as i32) - (dock_fb.height as i32) - 10;
-                blit_framebuffer(&mut desktop, &dock_fb, dx, dy);
-            }
-        }
-
-        // 5. Render Quick Settings / Control Center if visible (top-right overlay)
-        let qs_visible = self
-            .widgets
-            .get("quick_settings")
-            .map(|w| w.visible)
-            .unwrap_or(false)
-            || self
-                .widgets
-                .get("control-center")
-                .map(|w| w.visible)
-                .unwrap_or(false);
-        if qs_visible {
-            if let Some(qs_fb) = self.render_surface("quick_settings") {
-                let qx = (width as i32) - (qs_fb.width as i32) - 16;
-                let qy = 54;
-                blit_framebuffer(&mut desktop, &qs_fb, qx, qy);
-            }
-        }
-
-        // 6. Render App Launcher modal if visible (centered overlay)
-        let launcher_visible = self
-            .widgets
-            .get("launcher")
-            .map(|w| w.visible)
-            .unwrap_or(false);
-        if launcher_visible {
-            if let Some(launcher_fb) = self.render_surface("launcher") {
-                let lx = ((width as i32) - (launcher_fb.width as i32)) / 2;
-                let ly = ((height as i32) - (launcher_fb.height as i32)) / 2;
-                blit_framebuffer(&mut desktop, &launcher_fb, lx, ly);
-            }
-        }
-
-        // 7. Render Toast Notifications when overlays are closed and a toast is present
-        if !qs_visible && !launcher_visible {
-            let has_toast = self
-                .store
-                .get("notif.toasts.len")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                > 0;
-            if has_toast {
-                if let Some(toast_fb) = self.render_surface("notifications") {
-                    blit_framebuffer(&mut desktop, &toast_fb, (width as i32) - 376, 54);
+        // 3. Render all visible Shell Layer Surfaces in bottom-to-top order from `ShellLayout`
+        for layer_place in layout.layers_bottom_to_top() {
+            if layer_place.visible {
+                if let Some(layer_fb) = self.render_surface(&layer_place.name) {
+                    blit_framebuffer(
+                        &mut desktop,
+                        &layer_fb,
+                        layer_place.rect.x.round() as i32,
+                        layer_place.rect.y.round() as i32,
+                    );
                 }
             }
         }
@@ -875,6 +956,7 @@ impl LuminaDaemon {
             self.style_engine.set_custom_property(k, v);
         }
         self.current_theme = theme_name.to_string();
+        self.wallpaper_serial = self.wallpaper_serial.wrapping_add(1);
         self.cached_wallpaper = None;
         self.window_frame_cache.clear();
         self.store
@@ -904,6 +986,14 @@ impl LuminaDaemon {
             }
         }
         if found {
+            let usable = self.shell_layout().usable_rect();
+            let output_name = self
+                .wm
+                .outputs()
+                .first()
+                .map(|o| o.name.clone())
+                .unwrap_or_else(|| "eDP-1".to_string());
+            self.wm.set_output_usable_rect(&output_name, usable);
             Ok(final_vis)
         } else {
             Err(format!("Widget '{name}' not found"))
@@ -918,6 +1008,9 @@ impl LuminaDaemon {
                         self.window_frame_cache.remove(&target_id);
                         if let Some(ref mut wl) = self.wayland_server {
                             wl.close_window(target_id);
+                        }
+                        if self.external_compositor_active {
+                            self.pending_close_windows.push(target_id);
                         }
                     }
                 }
@@ -1049,10 +1142,12 @@ impl LuminaDaemon {
         let lower = app_id.to_ascii_lowercase();
 
         // Only use the built-in simulated terminal when explicitly requested via `org.lumina.terminal`
-        // or when running in headless mode without an embedded Wayland server.
-        let is_builtin_terminal = lower == "org.lumina.terminal" || self.wayland_server.is_none();
+        // or when running in headless mode without an embedded or external Wayland server.
+        let has_real_compositor =
+            self.wayland_server.is_some() || self.external_compositor_active;
+        let is_builtin_terminal = lower == "org.lumina.terminal" || !has_real_compositor;
 
-        if !is_builtin_terminal && self.wayland_server.is_some() {
+        if !is_builtin_terminal && has_real_compositor {
             let exec_cmd = if (lower == "alacritty"
                 || lower == "org.alacritty.alacritty"
                 || lower == "terminal"
@@ -1068,6 +1163,11 @@ impl LuminaDaemon {
                     .map(|entry| entry.exec.clone())
                     .unwrap_or_else(|| app_id.to_string())
             };
+
+            if self.external_compositor_active {
+                self.pending_spawn_commands.push(exec_cmd);
+                return;
+            }
 
             if let Some(ref mut wl) = self.wayland_server {
                 if wl.spawn_client(&exec_cmd).is_ok() {

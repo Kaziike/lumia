@@ -1,11 +1,17 @@
 pub mod cli;
 pub mod daemon;
+pub mod input_router;
 pub mod nested;
 pub mod output_config;
+pub mod shell;
+pub mod shell_layout;
 pub mod wayland_compositor;
 
 pub use cli::*;
+pub use input_router::InputRouter;
 pub use nested::NestedApp;
+pub use shell::LuminaShell;
+pub use shell_layout::ShellLayout;
 pub use wayland_compositor::{RealWaylandServer, WaylandCompositorEvent};
 pub use css_style;
 pub use daemon::LuminaDaemon;

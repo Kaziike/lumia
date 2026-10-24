@@ -377,20 +377,44 @@ impl LuminaWmCore {
         self.sync_workspace_and_window_geometries();
     }
 
+    /// Sets the computed usable rectangle for a specific output (or the primary output) directly
+    /// from aggregated layer-shell exclusive zones.
+    pub fn set_output_usable_rect(&mut self, output_name: &str, usable_rect: Rect) {
+        if let Some(out) = self
+            .outputs
+            .iter_mut()
+            .find(|o| o.name == output_name)
+        {
+            if out.usable_rect != usable_rect {
+                out.usable_rect = usable_rect;
+                self.sync_workspace_and_window_geometries();
+            }
+        }
+    }
+
+    /// Returns the usable rectangle for a named output, falling back to the primary output.
+    pub fn usable_rect_for_output(&self, output_name: &str) -> Rect {
+        self.outputs
+            .iter()
+            .find(|o| o.name == output_name)
+            .or_else(|| self.outputs.first())
+            .map(|o| o.usable_rect)
+            .unwrap_or_else(|| {
+                let top_zone = self.config.default_topbar_exclusive_zone.max(0.0);
+                Rect::new(0.0, top_zone, 1920.0, (1080.0 - top_zone).max(100.0))
+            })
+    }
+
     pub fn primary_usable_rect(&self) -> Rect {
         let output_name = self
             .workspaces
             .iter()
             .find(|ws| ws.id == self.active_workspace)
             .map(|ws| ws.output.as_str())
+            .or_else(|| self.outputs.first().map(|o| o.name.as_str()))
             .unwrap_or("eDP-1");
 
-        self.outputs
-            .iter()
-            .find(|o| o.name == output_name)
-            .or_else(|| self.outputs.first())
-            .map(|o| o.usable_rect)
-            .unwrap_or_else(|| Rect::new(0.0, 44.0, 1920.0, 1036.0))
+        self.usable_rect_for_output(output_name)
     }
 
     fn resolve_workspace_target(&self, target: &WorkspaceTarget) -> Result<WorkspaceId, String> {

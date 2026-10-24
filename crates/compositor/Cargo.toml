@@ -1,0 +1,21 @@
+[package]
+name = "compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+wm-proto.workspace = true
+wm-core.workspace = true
+ipc-server.workspace = true
+renderer.workspace = true
+tracing.workspace = true
+smithay = { version = "0.7.0", default-features = false, features = [
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+    "backend_winit",
+    "backend_egl",
+    "backend_drm",
+] }
+calloop = { version = "0.14", features = ["executor"] }

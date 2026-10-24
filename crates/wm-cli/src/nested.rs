@@ -2,8 +2,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
 use ipc_server::{default_socket_path, AssetWatcher, IpcServer};
-use renderer::{hit_test_resize_edge, hit_test_titlebar, TitlebarHit};
 use softbuffer::{Context, Surface};
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
@@ -11,32 +11,79 @@ use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, Window
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
-use wm_proto::{
-    ActionCommand, AppsAction, Direction, Edges, Point, Rect, ResizeEdge, ShellAction,
-    WindowManagerEngine, WmAction, WorkspaceTarget,
-};
+use wm_proto::{ActionCommand, Point};
+
 use crate::daemon::LuminaDaemon;
+use crate::input_router::{InputRouter, KeyInput, KeySymbol, Modifiers, PointerButton};
 
-#[derive(Clone, Copy, Debug)]
-struct DragState {
-    start_desktop_pt: Point,
-}
-
-fn mouse_button_to_linux_code(button: MouseButton) -> Option<u32> {
+fn winit_button_to_pointer_button(button: MouseButton) -> Option<PointerButton> {
     match button {
-        MouseButton::Left => Some(0x110),
-        MouseButton::Right => Some(0x111),
-        MouseButton::Middle => Some(0x112),
+        MouseButton::Left => Some(PointerButton::Left),
+        MouseButton::Right => Some(PointerButton::Right),
+        MouseButton::Middle => Some(PointerButton::Middle),
         _ => None,
     }
 }
 
-fn keycode_to_evdev(code: KeyCode) -> Option<u32> {
+fn winit_mods_to_router_mods(mods: ModifiersState) -> Modifiers {
+    Modifiers {
+        shift: mods.shift_key(),
+        ctrl: mods.control_key(),
+        alt: mods.alt_key(),
+        logo: mods.super_key(),
+    }
+}
+
+fn keycode_to_digit(code: KeyCode) -> Option<u8> {
+    match code {
+        KeyCode::Digit1 => Some(1),
+        KeyCode::Digit2 => Some(2),
+        KeyCode::Digit3 => Some(3),
+        KeyCode::Digit4 => Some(4),
+        KeyCode::Digit5 => Some(5),
+        KeyCode::Digit6 => Some(6),
+        KeyCode::Digit7 => Some(7),
+        KeyCode::Digit8 => Some(8),
+        KeyCode::Digit9 => Some(9),
+        _ => None,
+    }
+}
+
+fn winit_logical_key_to_symbol(key: &Key) -> KeySymbol {
+    match key {
+        Key::Named(NamedKey::Enter) => KeySymbol::Enter,
+        Key::Named(NamedKey::Escape) => KeySymbol::Escape,
+        Key::Named(NamedKey::Space) => KeySymbol::Space,
+        Key::Named(NamedKey::Tab) => KeySymbol::Tab,
+        Key::Named(NamedKey::Backspace) => KeySymbol::Backspace,
+        Key::Named(NamedKey::Super) => KeySymbol::Super,
+        Key::Named(NamedKey::ArrowLeft) => KeySymbol::ArrowLeft,
+        Key::Named(NamedKey::ArrowRight) => KeySymbol::ArrowRight,
+        Key::Named(NamedKey::ArrowUp) => KeySymbol::ArrowUp,
+        Key::Named(NamedKey::ArrowDown) => KeySymbol::ArrowDown,
+        Key::Named(NamedKey::F1) => KeySymbol::F(1),
+        Key::Named(NamedKey::F2) => KeySymbol::F(2),
+        Key::Named(NamedKey::F3) => KeySymbol::F(3),
+        Key::Named(NamedKey::F4) => KeySymbol::F(4),
+        Key::Named(NamedKey::F5) => KeySymbol::F(5),
+        Key::Named(NamedKey::F6) => KeySymbol::F(6),
+        Key::Named(NamedKey::F7) => KeySymbol::F(7),
+        Key::Named(NamedKey::F8) => KeySymbol::F(8),
+        Key::Named(NamedKey::F9) => KeySymbol::F(9),
+        Key::Named(NamedKey::F10) => KeySymbol::F(10),
+        Key::Named(NamedKey::F11) => KeySymbol::F(11),
+        Key::Named(NamedKey::F12) => KeySymbol::F(12),
+        Key::Character(c) => KeySymbol::Char(c.to_string()),
+        _ => KeySymbol::Other,
+    }
+}
+
+pub fn keycode_to_evdev(code: KeyCode) -> Option<u32> {
     match code {
         KeyCode::Escape => Some(1),
         KeyCode::Digit1 => Some(2),
         KeyCode::Digit2 => Some(3),
-        KeyCode::Digit3 => Some(4),
+        KeyCode::Digit3 => Some(3 + 1),
         KeyCode::Digit4 => Some(5),
         KeyCode::Digit5 => Some(6),
         KeyCode::Digit6 => Some(7),
@@ -127,6 +174,7 @@ pub struct NestedApp {
     theme: String,
     initial_actions: Vec<String>,
     daemon: Option<LuminaDaemon>,
+    input_router: InputRouter,
     window: Option<Arc<Window>>,
     context: Option<Context<Arc<Window>>>,
     surface: Option<Surface<Arc<Window>, Arc<Window>>>,
@@ -134,8 +182,6 @@ pub struct NestedApp {
     watcher: Option<AssetWatcher>,
     cursor_pos: Point,
     cursor_dirty: bool,
-    drag_state: Option<DragState>,
-    pressed_client_win: Option<(u64, u32)>,
     modifiers: ModifiersState,
     last_sys_poll: Instant,
     last_redraw: Instant,
@@ -159,6 +205,7 @@ impl NestedApp {
             theme,
             initial_actions,
             daemon: None,
+            input_router: InputRouter::new(),
             window: None,
             context: None,
             surface: None,
@@ -166,8 +213,6 @@ impl NestedApp {
             watcher: None,
             cursor_pos: Point::new(0.0, 0.0),
             cursor_dirty: false,
-            drag_state: None,
-            pressed_client_win: None,
             modifiers: ModifiersState::default(),
             last_sys_poll: now,
             last_redraw: now,
@@ -212,329 +257,35 @@ impl NestedApp {
         }
     }
 
-    /// Coalesces high-frequency Wayland mouse motion events so layout/hover/drag updates
-    /// happen at most once per rendered frame instead of on every 1000Hz pointer event.
+    /// Coalesces high-frequency Wayland mouse motion events through `InputRouter`.
     fn process_pending_cursor_move(&mut self) -> bool {
         if !self.cursor_dirty {
             return false;
         }
         self.cursor_dirty = false;
         let desktop_pt = self.desktop_cursor();
-        let (dw, dh) = self.desktop_size();
-
-        // Fast O(1) interactive window move: no DOM/CSS/Taffy recomputation during drag!
-        if let Some(drag) = self.drag_state {
-            let dx = desktop_pt.x - drag.start_desktop_pt.x;
-            let dy = desktop_pt.y - drag.start_desktop_pt.y;
-            if let Some(daemon) = self.daemon.as_mut() {
-                return daemon.wm.move_interactive_grab_fast(dx, dy);
-            }
-            return false;
-        }
-
         let Some(daemon) = self.daemon.as_mut() else {
             return false;
         };
-
-        let mut hover_changed = false;
-
-        // Update hover state on visible surfaces in desktop coordinates
-        let launcher_visible = daemon
-            .widgets
-            .get("launcher")
-            .map(|w| w.visible)
-            .unwrap_or(false);
-        if launcher_visible {
-            let lx = (dw - 640.0) / 2.0;
-            let ly = (dh - 440.0) / 2.0;
-            hover_changed |=
-                daemon.update_hover("launcher", desktop_pt.x - lx, desktop_pt.y - ly);
-        }
-
-        let qs_visible = daemon
-            .widgets
-            .get("quick_settings")
-            .map(|w| w.visible)
-            .unwrap_or(false);
-        let (qs_w, _qs_h) = daemon
-            .widgets
-            .get("quick_settings")
-            .map(|w| (w.width as f32, w.height as f32))
-            .unwrap_or((380.0, 560.0));
-        if qs_visible {
-            let qx = dw - qs_w - 16.0;
-            let qy = 54.0;
-            hover_changed |=
-                daemon.update_hover("quick_settings", desktop_pt.x - qx, desktop_pt.y - qy);
-        } else if daemon
-            .surfaces
-            .get("notifications")
-            .map(|s| s.visible)
-            .unwrap_or(false)
-        {
-            let qx = dw - 360.0 - 16.0;
-            let qy = 54.0;
-            hover_changed |=
-                daemon.update_hover("notifications", desktop_pt.x - qx, desktop_pt.y - qy);
-        }
-
-        hover_changed |= daemon.update_hover("topbar", desktop_pt.x, desktop_pt.y);
-
-        let dock_visible = daemon
-            .surfaces
-            .get("dock")
-            .map(|s| s.visible)
-            .unwrap_or(true);
-        if dock_visible {
-            let dx = (dw - 680.0) / 2.0;
-            let dy = dh - 58.0 - 10.0;
-            hover_changed |= daemon.update_hover("dock", desktop_pt.x - dx, desktop_pt.y - dy);
-        }
-
-        // Forward pointer motion to the topmost Wayland client window if cursor is inside its content_rect
-        if !launcher_visible && !qs_visible && daemon.wayland_server.is_some() {
-            let usable = daemon
-                .wm
-                .outputs()
-                .first()
-                .map(|o| o.usable_rect)
-                .unwrap_or(Rect::new(0.0, 44.0, dw, (dh - 44.0).max(100.0)));
-            let placements = daemon.wm.compute_window_placements(usable);
-            for p in placements.iter().rev() {
-                if p.content_rect.contains(desktop_pt) {
-                    if let Some(ref mut wl) = daemon.wayland_server {
-                        let local_x = desktop_pt.x - p.content_rect.x;
-                        let local_y = desktop_pt.y - p.content_rect.y;
-                        wl.send_pointer_motion(p.window_id, local_x, local_y);
-                    }
-                    break;
-                }
-            }
-        }
-
-        hover_changed
+        let outcome = self.input_router.on_pointer_motion(daemon, desktop_pt);
+        InputRouter::apply_forwards_to_legacy_server(daemon, &outcome.client_forwards);
+        outcome.redraw
     }
 
-    fn handle_mouse_click(&mut self, button: MouseButton) {
-        let Some(btn_code) = mouse_button_to_linux_code(button) else {
+    fn handle_mouse_button(&mut self, button: MouseButton, pressed: bool) {
+        let Some(ptr_btn) = winit_button_to_pointer_button(button) else {
             return;
         };
-
         let desktop_pt = self.desktop_cursor();
-        let (dw, dh) = self.desktop_size();
-        let Point { x, y } = desktop_pt;
         let Some(daemon) = self.daemon.as_mut() else {
             return;
         };
-
-        if button == MouseButton::Left {
-            // 1. Check if Launcher modal is open (centered 640x440)
-            let launcher_visible = daemon
-                .widgets
-                .get("launcher")
-                .map(|w| w.visible)
-                .unwrap_or(false);
-            if launcher_visible {
-                let lx = (dw - 640.0) / 2.0;
-                let ly = (dh - 440.0) / 2.0;
-                let modal_rect = Rect::new(lx, ly, 640.0, 440.0);
-                if modal_rect.contains(desktop_pt) {
-                    let _ = daemon.click_surface("launcher", x - lx, y - ly);
-                } else {
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
-                        name: "launcher".to_string(),
-                    }));
-                }
-                self.request_redraw();
-                return;
-            }
-
-            // 2. Check if Quick Settings modal is open (top-right)
-            let qs_visible = daemon
-                .widgets
-                .get("quick_settings")
-                .map(|w| w.visible)
-                .unwrap_or(false);
-            let (qs_w, qs_h) = daemon
-                .widgets
-                .get("quick_settings")
-                .map(|w| (w.width as f32, w.height as f32))
-                .unwrap_or((380.0, 560.0));
-            if qs_visible {
-                let qx = dw - qs_w - 16.0;
-                let qy = 54.0;
-                let modal_rect = Rect::new(qx, qy, qs_w, qs_h);
-                if modal_rect.contains(desktop_pt) {
-                    let _ = daemon.click_surface("quick_settings", x - qx, y - qy);
-                } else {
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
-                        name: "quick_settings".to_string(),
-                    }));
-                }
-                self.request_redraw();
-                return;
-            }
-
-            // 2b. Check if notifications toast widget is visible at top-right (!qs_visible)
-            if daemon
-                .surfaces
-                .get("notifications")
-                .map(|s| s.visible)
-                .unwrap_or(false)
-            {
-                let qx = dw - 360.0 - 16.0;
-                let qy = 54.0;
-                let notif_rect = Rect::new(qx, qy, 360.0, 110.0);
-                if notif_rect.contains(desktop_pt) {
-                    let _ = daemon.click_surface("notifications", x - qx, y - qy);
-                    self.request_redraw();
-                    return;
-                }
-            }
-
-            // 3. Topbar: y < 44
-            if y < 44.0 {
-                let _ = daemon.click_surface("topbar", x, y);
-                self.request_redraw();
-                return;
-            }
-
-            // 4. Bottom Dock: centered at bottom (680x58)
-            let dock_visible = daemon
-                .surfaces
-                .get("dock")
-                .map(|s| s.visible)
-                .unwrap_or(true);
-            if dock_visible {
-                let dock_w = 680.0;
-                let dock_h = 58.0;
-                let dx = (dw - dock_w) / 2.0;
-                let dy = dh - dock_h - 10.0;
-                let dock_rect = Rect::new(dx, dy, dock_w, dock_h);
-                if dock_rect.contains(desktop_pt) {
-                    let _ = daemon.click_surface("dock", x - dx, y - dy);
-                    self.request_redraw();
-                    return;
-                }
-            }
-        }
-
-        // 5. Window Frame / Server-Side Titlebar buttons, 8-Edge Resize & Client Area
-        let usable = daemon
-            .wm
-            .outputs()
-            .first()
-            .map(|o| o.usable_rect)
-            .unwrap_or(Rect::new(0.0, 44.0, dw, (dh - 44.0).max(100.0)));
-        let placements = daemon.wm.compute_window_placements(usable);
-
-        for p in placements.iter().rev() {
-            if p.frame_rect.inset(Edges::all(-4.0)).contains(desktop_pt) {
-                // Focus clicked window first
-                if !p.is_focused {
-                    let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWindow {
-                        id: p.window_id,
-                    }));
-                }
-                if let Some(ref mut wl) = daemon.wayland_server {
-                    wl.focus_window_keyboard(Some(p.window_id));
-                }
-
-                // Super + Left Click anywhere inside window starts interactive move
-                if self.modifiers.super_key() && button == MouseButton::Left {
-                    let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveMove {
-                        win_id: p.window_id,
-                    });
-                    self.drag_state = Some(DragState {
-                        start_desktop_pt: desktop_pt,
-                    });
-                    self.request_redraw();
-                    return;
-                }
-
-                // Super + Right Click anywhere inside window starts interactive resize (BottomRight)
-                if self.modifiers.super_key() && button == MouseButton::Right {
-                    let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveResize {
-                        win_id: p.window_id,
-                        edge: ResizeEdge::BottomRight,
-                    });
-                    self.drag_state = Some(DragState {
-                        start_desktop_pt: desktop_pt,
-                    });
-                    self.request_redraw();
-                    return;
-                }
-
-                // Normal Left Click: check titlebar buttons, 8-edge resize border, or titlebar drag
-                if button == MouseButton::Left {
-                    let tb_hit = hit_test_titlebar(p, desktop_pt);
-                    match tb_hit {
-                        Some(TitlebarHit::Float) => {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::ToggleFloating {
-                                    id: Some(p.window_id),
-                                },
-                            ));
-                            self.request_redraw();
-                            return;
-                        }
-                        Some(TitlebarHit::Maximize) => {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::ToggleMaximize {
-                                    id: Some(p.window_id),
-                                },
-                            ));
-                            self.request_redraw();
-                            return;
-                        }
-                        Some(TitlebarHit::Close) => {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::CloseWindow {
-                                    id: Some(p.window_id),
-                                },
-                            ));
-                            self.request_redraw();
-                            return;
-                        }
-                        _ => {}
-                    }
-
-                    if let Some(edge) = hit_test_resize_edge(p, desktop_pt) {
-                        let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveResize {
-                            win_id: p.window_id,
-                            edge,
-                        });
-                        self.drag_state = Some(DragState {
-                            start_desktop_pt: desktop_pt,
-                        });
-                        self.request_redraw();
-                        return;
-                    }
-
-                    if matches!(tb_hit, Some(TitlebarHit::DragArea)) {
-                        let _ = daemon.wm.dispatch_wm_action(&WmAction::BeginInteractiveMove {
-                            win_id: p.window_id,
-                        });
-                        self.drag_state = Some(DragState {
-                            start_desktop_pt: desktop_pt,
-                        });
-                        self.request_redraw();
-                        return;
-                    }
-                }
-
-                if p.content_rect.contains(desktop_pt) {
-                    // Forward pointer button press into the real Wayland client surface
-                    if let Some(ref mut wl) = daemon.wayland_server {
-                        let local_x = desktop_pt.x - p.content_rect.x;
-                        let local_y = desktop_pt.y - p.content_rect.y;
-                        wl.send_pointer_button_code(p.window_id, local_x, local_y, btn_code, true);
-                        self.pressed_client_win = Some((p.window_id, btn_code));
-                    }
-                }
-                self.request_redraw();
-                return;
-            }
+        let outcome = self
+            .input_router
+            .on_pointer_button(daemon, desktop_pt, ptr_btn, pressed);
+        InputRouter::apply_forwards_to_legacy_server(daemon, &outcome.client_forwards);
+        if outcome.redraw {
+            self.request_redraw();
         }
     }
 
@@ -543,377 +294,38 @@ impl NestedApp {
             MouseScrollDelta::LineDelta(x, y) => (x * 15.0, y * 15.0),
             MouseScrollDelta::PixelDelta(pos) => (pos.x as f32, pos.y as f32),
         };
-        if dx.abs() < 0.01 && dy.abs() < 0.01 {
-            return;
-        }
-        let scroll_up = dy > 0.0;
         let desktop_pt = self.desktop_cursor();
-        let (dw, dh) = self.desktop_size();
-
-        if let Some(daemon) = self.daemon.as_mut() {
-            if desktop_pt.y < 44.0 {
-                let _ = daemon.scroll_surface("topbar", desktop_pt.x, desktop_pt.y, scroll_up);
-                self.request_redraw();
-                return;
-            }
-
-            let usable = daemon
-                .wm
-                .outputs()
-                .first()
-                .map(|o| o.usable_rect)
-                .unwrap_or(Rect::new(0.0, 44.0, dw, (dh - 44.0).max(100.0)));
-            let placements = daemon.wm.compute_window_placements(usable);
-            for p in placements.iter().rev() {
-                if p.content_rect.contains(desktop_pt) {
-                    if let Some(ref mut wl) = daemon.wayland_server {
-                        // Wayland axis value: positive is down/right
-                        wl.send_pointer_axis(p.window_id, -dx, -dy);
-                    }
-                    self.request_redraw();
-                    break;
-                }
-            }
+        let Some(daemon) = self.daemon.as_mut() else {
+            return;
+        };
+        let outcome = self.input_router.on_pointer_axis(daemon, desktop_pt, dx, dy);
+        InputRouter::apply_forwards_to_legacy_server(daemon, &outcome.client_forwards);
+        if outcome.redraw {
+            self.request_redraw();
         }
     }
 
     fn handle_key_input(&mut self, key_event: KeyEvent) {
         let pressed = key_event.state == ElementState::Pressed;
-
+        let (digit_code, evdev_code) = match key_event.physical_key {
+            PhysicalKey::Code(code) => (keycode_to_digit(code), keycode_to_evdev(code)),
+            _ => (None, None),
+        };
+        let key_input = KeyInput {
+            sym: winit_logical_key_to_symbol(&key_event.logical_key),
+            digit_code,
+            evdev_code,
+            pressed,
+            repeat: key_event.repeat,
+            mods: winit_mods_to_router_mods(self.modifiers),
+        };
         let Some(daemon) = self.daemon.as_mut() else {
             return;
         };
-
-        let launcher_open = daemon
-            .widgets
-            .get("launcher")
-            .map(|w| w.visible)
-            .unwrap_or(false);
-        let qs_open = daemon
-            .widgets
-            .get("quick_settings")
-            .map(|w| w.visible)
-            .unwrap_or(false);
-
-        // Global WM shortcuts on key press
-        if pressed {
-            // Alt + Space toggles Launcher
-            if self.modifiers.alt_key() && matches!(key_event.logical_key, Key::Named(NamedKey::Space)) {
-                let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::ToggleWidget {
-                    name: "launcher".to_string(),
-                    args: Default::default(),
-                }));
-                self.request_redraw();
-                return;
-            }
-
-            // Alt + F4 closes focused window
-            if self.modifiers.alt_key() && matches!(key_event.logical_key, Key::Named(NamedKey::F4)) {
-                let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::CloseWindow {
-                    id: None,
-                }));
-                self.request_redraw();
-                return;
-            }
-
-            // Super + <key> shortcuts
-            if self.modifiers.super_key() && !matches!(key_event.logical_key, Key::Named(NamedKey::Super)) {
-                // Close launcher if it was opened when Super key was pressed down
-                if launcher_open {
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
-                        name: "launcher".to_string(),
-                    }));
-                }
-
-                if let PhysicalKey::Code(code) = key_event.physical_key {
-                    let ws_idx = match code {
-                        KeyCode::Digit1 => Some(1),
-                        KeyCode::Digit2 => Some(2),
-                        KeyCode::Digit3 => Some(3),
-                        KeyCode::Digit4 => Some(4),
-                        KeyCode::Digit5 => Some(5),
-                        KeyCode::Digit6 => Some(6),
-                        KeyCode::Digit7 => Some(7),
-                        KeyCode::Digit8 => Some(8),
-                        KeyCode::Digit9 => Some(9),
-                        _ => None,
-                    };
-                    if let Some(idx) = ws_idx {
-                        if self.modifiers.shift_key() {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::MoveWindowToWorkspace {
-                                    win_id: None,
-                                    workspace: WorkspaceTarget::Index(idx),
-                                },
-                            ));
-                        } else {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::FocusWorkspace {
-                                    target: WorkspaceTarget::Index(idx),
-                                },
-                            ));
-                        }
-                        self.request_redraw();
-                        return;
-                    }
-                }
-
-                match &key_event.logical_key {
-                    Key::Named(NamedKey::Enter) => {
-                        let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::Launch {
-                            app_id: "org.gnome.Console".to_string(),
-                        }));
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Character(c) if c.eq_ignore_ascii_case("q") => {
-                        let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::CloseWindow {
-                            id: None,
-                        }));
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Character(c) if c.eq_ignore_ascii_case("f") => {
-                        if self.modifiers.shift_key() {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::ToggleFullscreen { id: None },
-                            ));
-                        } else {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::ToggleMaximize { id: None },
-                            ));
-                        }
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Character(c) if c.eq_ignore_ascii_case("v") => {
-                        let _ = daemon.dispatch_action(ActionCommand::Wm(
-                            WmAction::ToggleFloating { id: None },
-                        ));
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Named(NamedKey::Space) => {
-                        let _ = daemon.dispatch_action(ActionCommand::Wm(
-                            WmAction::CycleLayoutMode,
-                        ));
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Named(
-                         k @ (NamedKey::ArrowLeft
-                        | NamedKey::ArrowRight
-                        | NamedKey::ArrowUp
-                        | NamedKey::ArrowDown),
-                    ) => {
-                        let dir = match k {
-                            NamedKey::ArrowLeft => Direction::Left,
-                            NamedKey::ArrowRight => Direction::Right,
-                            NamedKey::ArrowUp => Direction::Up,
-                            NamedKey::ArrowDown => Direction::Down,
-                            _ => Direction::Right,
-                        };
-                        if self.modifiers.shift_key() {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::MoveWindowDirection { dir },
-                            ));
-                        } else {
-                            let _ = daemon.dispatch_action(ActionCommand::Wm(
-                                WmAction::FocusDirection { dir },
-                            ));
-                        }
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Named(NamedKey::Tab) => {
-                        let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusDirection {
-                            dir: Direction::Right,
-                        }));
-                        self.request_redraw();
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-
-            match &key_event.logical_key {
-                Key::Named(NamedKey::Super) => {
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::ToggleWidget {
-                        name: "launcher".to_string(),
-                        args: Default::default(),
-                    }));
-                    self.request_redraw();
-                    return;
-                }
-                Key::Named(NamedKey::Escape) if launcher_open || qs_open => {
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
-                        name: "launcher".to_string(),
-                    }));
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
-                        name: "quick_settings".to_string(),
-                    }));
-                    self.request_redraw();
-                    return;
-                }
-                Key::Named(
-                    f_key @ (NamedKey::F1
-                    | NamedKey::F2
-                    | NamedKey::F3
-                    | NamedKey::F4
-                    | NamedKey::F5
-                    | NamedKey::F6
-                    | NamedKey::F7
-                    | NamedKey::F8
-                    | NamedKey::F9),
-                ) => {
-                    let idx = match f_key {
-                        NamedKey::F1 => 1,
-                        NamedKey::F2 => 2,
-                        NamedKey::F3 => 3,
-                        NamedKey::F4 => 4,
-                        NamedKey::F5 => 5,
-                        NamedKey::F6 => 6,
-                        NamedKey::F7 => 7,
-                        NamedKey::F8 => 8,
-                        NamedKey::F9 => 9,
-                        _ => 1,
-                    };
-                    let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusWorkspace {
-                        target: WorkspaceTarget::Index(idx),
-                    }));
-                    self.request_redraw();
-                    return;
-                }
-                _ => {}
-            }
-        }
-
-        // If Launcher modal is open, route keyboard input exclusively to Launcher search/navigation
-        if launcher_open {
-            if !pressed {
-                return;
-            }
-            match &key_event.logical_key {
-                Key::Named(NamedKey::ArrowDown) => {
-                    let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::SelectRelative {
-                        delta: 1,
-                    }));
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::ArrowUp) => {
-                    let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::SelectRelative {
-                        delta: -1,
-                    }));
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Enter) => {
-                    let _ =
-                        daemon.dispatch_action(ActionCommand::Apps(AppsAction::LaunchSelected));
-                    let _ = daemon.dispatch_action(ActionCommand::Shell(ShellAction::CloseWidget {
-                        name: "launcher".to_string(),
-                    }));
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Space) => {
-                    let mut query = daemon
-                        .get_state_path(Some("apps.query"))
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    query.push(' ');
-                    let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::SetQuery {
-                        query,
-                    }));
-                    self.request_redraw();
-                }
-                Key::Character(c) => {
-                    let mut query = daemon
-                        .get_state_path(Some("apps.query"))
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    query.push_str(c);
-                    let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::SetQuery {
-                        query,
-                    }));
-                    self.request_redraw();
-                }
-                Key::Named(NamedKey::Backspace) => {
-                    let mut query = daemon
-                        .get_state_path(Some("apps.query"))
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string();
-                    query.pop();
-                    let _ = daemon.dispatch_action(ActionCommand::Apps(AppsAction::SetQuery {
-                        query,
-                    }));
-                    self.request_redraw();
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        // Alt+Tab or Super+Tab cycles window focus
-        if pressed
-            && matches!(key_event.logical_key, Key::Named(NamedKey::Tab))
-            && (self.modifiers.alt_key() || self.modifiers.super_key())
-        {
-            let _ = daemon.dispatch_action(ActionCommand::Wm(WmAction::FocusDirection {
-                dir: wm_proto::Direction::Right,
-            }));
+        let outcome = self.input_router.on_key_input(daemon, key_input);
+        InputRouter::apply_forwards_to_legacy_server(daemon, &outcome.client_forwards);
+        if outcome.redraw {
             self.request_redraw();
-            return;
-        }
-
-        // Route input to the focused window (Wayland client or built-in simulated terminal)
-        if let Some(focused_id) = daemon.wm.focused_window_id() {
-            let is_builtin_term = daemon
-                .wm
-                .windows()
-                .into_iter()
-                .find(|w| w.id == focused_id)
-                .map(|w| w.app_id == "org.lumina.terminal")
-                .unwrap_or(false);
-
-            if is_builtin_term {
-                if !pressed {
-                    return;
-                }
-                match &key_event.logical_key {
-                    Key::Named(NamedKey::Enter) => {
-                        daemon.terminal_execute();
-                        self.request_redraw();
-                    }
-                    Key::Named(NamedKey::Space) => {
-                        daemon.terminal_push_str(" ");
-                        self.request_redraw();
-                    }
-                    Key::Character(c) => {
-                        daemon.terminal_push_str(c);
-                        self.request_redraw();
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        daemon.terminal_backspace();
-                        self.request_redraw();
-                    }
-                    _ => {}
-                }
-                return;
-            }
-
-            // Real Wayland client window: forward evdev keycode press/release
-            if !key_event.repeat {
-                if let PhysicalKey::Code(code) = key_event.physical_key {
-                    if let Some(evdev) = keycode_to_evdev(code) {
-                        if let Some(ref mut wl) = daemon.wayland_server {
-                            wl.send_key(focused_id, evdev, pressed);
-                            self.request_redraw();
-                        }
-                    }
-                }
-            }
         }
     }
 }
@@ -968,13 +380,10 @@ impl ApplicationHandler for NestedApp {
         // Initialize daemon
         let mut daemon = LuminaDaemon::new();
         daemon.assets_dir = Some(self.assets_path.clone());
-        // Start interactive nested session with a clean desktop (no pre-opened fake windows)
         daemon.clear_startup_windows();
         match daemon.enable_wayland_server() {
             Ok(sock_name) => {
-                println!(
-                    "Embedded Wayland Compositor active on WAYLAND_DISPLAY={sock_name}"
-                );
+                println!("Embedded Wayland Compositor active on WAYLAND_DISPLAY={sock_name}");
             }
             Err(e) => {
                 eprintln!("Warning: could not bind embedded Wayland server: {e}");
@@ -1005,7 +414,10 @@ impl ApplicationHandler for NestedApp {
                 Some(s)
             }
             Err(e) => {
-                eprintln!("Warning: could not bind IPC socket at {:?}: {e}", self.socket_path);
+                eprintln!(
+                    "Warning: could not bind IPC socket at {:?}: {e}",
+                    self.socket_path
+                );
                 None
             }
         };
@@ -1043,10 +455,9 @@ impl ApplicationHandler for NestedApp {
                     daemon.resize_output(self.width, self.height, scale);
                 }
                 if let Some(surface) = self.surface.as_mut() {
-                    if let (Some(w), Some(h)) = (
-                        NonZeroU32::new(self.width),
-                        NonZeroU32::new(self.height),
-                    ) {
+                    if let (Some(w), Some(h)) =
+                        (NonZeroU32::new(self.width), NonZeroU32::new(self.height))
+                    {
                         let _ = surface.resize(w, h);
                     }
                 }
@@ -1060,19 +471,9 @@ impl ApplicationHandler for NestedApp {
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
-                let mut depressed = 0u32;
-                if self.modifiers.shift_key() {
-                    depressed |= 1;
-                }
-                if self.modifiers.control_key() {
-                    depressed |= 4;
-                }
-                if self.modifiers.alt_key() {
-                    depressed |= 8;
-                }
-                if self.modifiers.super_key() {
-                    depressed |= 64;
-                }
+                let router_mods = winit_mods_to_router_mods(self.modifiers);
+                self.input_router.set_modifiers(router_mods);
+                let depressed = router_mods.to_xkb_depressed_mask();
                 if let Some(daemon) = self.daemon.as_mut() {
                     if let Some(ref mut wl) = daemon.wayland_server {
                         wl.send_modifiers(depressed, 0, 0, 0);
@@ -1082,75 +483,34 @@ impl ApplicationHandler for NestedApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = Point::new(position.x as f32, position.y as f32);
                 self.cursor_dirty = true;
-                // Throttle redraw requests during high-frequency mouse motion to ~60 FPS
                 if self.last_redraw.elapsed() >= Duration::from_millis(14) {
-                    if self.drag_state.is_some() || self.process_pending_cursor_move() {
+                    if self.input_router.active_grab().is_some()
+                        || self.process_pending_cursor_move()
+                    {
                         self.request_redraw();
                     }
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => match state {
-                ElementState::Pressed => {
-                    self.handle_mouse_click(button);
-                    if self
-                        .daemon
-                        .as_ref()
-                        .is_some_and(|d| d.get_state_path(Some("sys.session.exit_requested")).as_bool())
-                    {
-                        event_loop.exit();
-                        return;
-                    }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                self.handle_mouse_button(button, pressed);
+                if self.daemon.as_ref().is_some_and(|d| {
+                    d.get_state_path(Some("sys.session.exit_requested"))
+                        .as_bool()
+                }) {
+                    event_loop.exit();
+                    return;
                 }
-                ElementState::Released => {
-                    if matches!(button, MouseButton::Left | MouseButton::Right)
-                        && self.drag_state.take().is_some()
-                    {
-                        if let Some(daemon) = self.daemon.as_mut() {
-                            daemon.wm.end_interactive_grab();
-                            let patches = daemon.wm.export_state_patches();
-                            daemon.apply_state_patches(patches);
-                        }
-                        self.request_redraw();
-                    }
-                    if let Some((win_id, btn_code)) = self.pressed_client_win.take() {
-                        let desktop_pt = self.desktop_cursor();
-                        let (dw, dh) = self.desktop_size();
-                        if let Some(daemon) = self.daemon.as_mut() {
-                            let usable = daemon
-                                .wm
-                                .outputs()
-                                .first()
-                                .map(|o| o.usable_rect)
-                                .unwrap_or(Rect::new(0.0, 44.0, dw, (dh - 44.0).max(100.0)));
-                            let placements = daemon.wm.compute_window_placements(usable);
-                            let (local_x, local_y) = placements
-                                .iter()
-                                .find(|p| p.window_id == win_id)
-                                .map(|p| {
-                                    (
-                                        desktop_pt.x - p.content_rect.x,
-                                        desktop_pt.y - p.content_rect.y,
-                                    )
-                                })
-                                .unwrap_or((0.0, 0.0));
-                            if let Some(ref mut wl) = daemon.wayland_server {
-                                wl.send_pointer_button_code(win_id, local_x, local_y, btn_code, false);
-                            }
-                        }
-                        self.request_redraw();
-                    }
-                }
-            },
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 self.handle_mouse_scroll(delta);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 self.handle_key_input(event);
-                if self
-                    .daemon
-                    .as_ref()
-                    .is_some_and(|d| d.get_state_path(Some("sys.session.exit_requested")).as_bool())
-                {
+                if self.daemon.as_ref().is_some_and(|d| {
+                    d.get_state_path(Some("sys.session.exit_requested"))
+                        .as_bool()
+                }) {
                     event_loop.exit();
                     return;
                 }
@@ -1160,7 +520,6 @@ impl ApplicationHandler for NestedApp {
                 self.last_redraw = Instant::now();
                 let _ = self.process_pending_cursor_move();
 
-                // Render composite frame and blit to softbuffer
                 let (width, height) = (self.width, self.height);
                 if let (Some(daemon), Some(surface)) =
                     (self.daemon.as_mut(), self.surface.as_mut())
@@ -1214,21 +573,18 @@ impl ApplicationHandler for NestedApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let mut dirty = false;
 
-        // 0. Process any remaining coalesced cursor movement
         if self.cursor_dirty && self.last_redraw.elapsed() >= Duration::from_millis(14) {
             if self.process_pending_cursor_move() {
                 dirty = true;
             }
         }
 
-        // 1. Poll embedded Wayland client applications (real apps rendering into Lumina WM)
         if let Some(daemon) = self.daemon.as_mut() {
             if daemon.poll_wayland_clients() {
                 dirty = true;
             }
         }
 
-        // 2. Poll IPC requests without blocking
         if let (Some(daemon), Some(ipc)) = (self.daemon.as_mut(), self.ipc_server.as_mut()) {
             if let Ok(count) = ipc.poll_once(|req| daemon.handle_ipc_request(req)) {
                 if count > 0 {
@@ -1237,7 +593,6 @@ impl ApplicationHandler for NestedApp {
             }
         }
 
-        // 3. Poll file hot reload
         if let (Some(daemon), Some(watcher)) = (self.daemon.as_mut(), self.watcher.as_mut()) {
             let reloaded = daemon.poll_hot_reload(watcher);
             if !reloaded.is_empty() {
@@ -1245,7 +600,6 @@ impl ApplicationHandler for NestedApp {
             }
         }
 
-        // 4. Poll system metrics once every 1.5s so idle CPU usage stays near 0%
         let now = Instant::now();
         if now.duration_since(self.last_sys_poll) >= Duration::from_millis(1500) {
             self.last_sys_poll = now;
@@ -1258,11 +612,10 @@ impl ApplicationHandler for NestedApp {
             }
         }
 
-        if self
-            .daemon
-            .as_ref()
-            .is_some_and(|d| d.get_state_path(Some("sys.session.exit_requested")).as_bool())
-        {
+        if self.daemon.as_ref().is_some_and(|d| {
+            d.get_state_path(Some("sys.session.exit_requested"))
+                .as_bool()
+        }) {
             event_loop.exit();
             return;
         }

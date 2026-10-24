@@ -1,11 +1,23 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+use compositor::run_winit_compositor;
 use ipc_server::{default_socket_path, AssetWatcher, IpcServer};
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use wm_cli::daemon::LuminaDaemon;
 use wm_cli::nested::NestedApp;
+use wm_cli::shell::LuminaShellAdapter;
 use wm_proto::ActionCommand;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum BackendKind {
+    /// Smithay Wayland compositor + GLES2/3 hardware-accelerated winit backend (with fallback if EGL is unavailable)
+    Auto,
+    /// Smithay Wayland compositor + GLES2/3 hardware-accelerated winit backend
+    Winit,
+    /// Legacy winit + softbuffer CPU compositor
+    Legacy,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -14,6 +26,10 @@ use wm_proto::ActionCommand;
     about = "Lumina Wayland Window Manager & Pure-Rust HTML/CSS Desktop Shell Compositor"
 )]
 struct LuminaDaemonArgs {
+    /// Compositor backend to run (`auto`, `winit` for Smithay GLES, or `legacy` for softbuffer)
+    #[arg(long, value_enum, default_value_t = BackendKind::Auto)]
+    backend: BackendKind,
+
     /// Unix domain socket path for IPC (`luminactl`)
     #[arg(short, long)]
     socket: Option<PathBuf>,
@@ -95,10 +111,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Interactive nested mode if not explicitly headless and no frame limit was given
+    // Interactive mode if not explicitly headless and no frame limit was given
     if !args.headless && args.headless_frames.is_none() {
-        let app = NestedApp::new(args.socket, args.assets, args.theme, args.dispatch);
-        return app.run();
+        match args.backend {
+            BackendKind::Legacy => {
+                let app = NestedApp::new(args.socket, args.assets, args.theme, args.dispatch);
+                return app.run();
+            }
+            BackendKind::Winit | BackendKind::Auto => {
+                let mut daemon = LuminaDaemon::new();
+                daemon.assets_dir = Some(args.assets.clone());
+                daemon.clear_startup_windows();
+                let _ = daemon.set_theme(&args.theme);
+                for dsl in &args.dispatch {
+                    if let Ok(cmds) = ActionCommand::parse_dsl_list(dsl) {
+                        for cmd in cmds {
+                            let _ = daemon.dispatch_action(cmd);
+                        }
+                    }
+                }
+                let ipc_server = IpcServer::bind(&sock_path)?;
+                let watcher = Some(AssetWatcher::new(&args.assets));
+                let adapter = Box::new(LuminaShellAdapter::new(daemon));
+
+                match run_winit_compositor(adapter, ipc_server, watcher) {
+                    Ok(()) => return Ok(()),
+                    Err(err) if args.backend == BackendKind::Auto => {
+                        tracing::warn!(
+                            "Smithay winit/EGL backend unavailable ({err}); falling back to legacy softbuffer backend"
+                        );
+                        let app =
+                            NestedApp::new(args.socket, args.assets, args.theme, args.dispatch);
+                        return app.run();
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            }
+        }
     }
 
     // Headless loop fallback

@@ -127,6 +127,7 @@ struct SurfaceEntry {
 }
 
 struct ToplevelEntry {
+    #[allow(dead_code)]
     window_id: u64,
     wl_surface_id: ObjectId,
     xdg_surface: XdgSurface,
